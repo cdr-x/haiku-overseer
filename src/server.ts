@@ -17,6 +17,7 @@ import {
   getTotalTokenUsage,
 } from "./db.js";
 import { callHaiku } from "./haiku.js";
+import { log1, log2 } from "./logger.js";
 
 // Database: project-local or HAIKU_DB_PATH env var
 const dbPath =
@@ -24,6 +25,7 @@ const dbPath =
   path.join(process.cwd(), ".haiku-overseer", "memory.db");
 const dbDir = path.dirname(dbPath);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+log1("Opening database at", dbPath);
 const db = openDb(dbPath);
 
 // Read project CLAUDE.md
@@ -87,8 +89,10 @@ async function executeHaikuCall(
   sessionId: string,
   turns: PendingBatch["turns"]
 ): Promise<string> {
+  log1("executeHaikuCall:", sessionId, `(${turns.length} turn(s))`);
   const errorCount = getErrorCount(db, sessionId, 5);
   const eventLog = buildEventLog(sessionId);
+  log2("Error count:", errorCount, "| Event log length:", eventLog.length);
 
   // Load recent session summaries for cross-session context
   const summaries = getRecentSummaries(db, 3);
@@ -126,7 +130,10 @@ async function executeHaikuCall(
       : ""
   }Latest turn${turns.length > 1 ? "s" : ""}:\n${latestSection}`;
 
+  log2("Haiku prompt length:", userMsg.length);
   const { text: haikuResponse, usage } = await callHaiku(SYSTEM_PROMPT, userMsg);
+  log1("Haiku response:", haikuResponse.trim() === "LGTM" ? "LGTM" : `Advisory (${haikuResponse.length} chars)`);
+  log2("Token usage: in=", usage.input_tokens, "out=", usage.output_tokens);
   insertTokenUsage(db, sessionId, usage.input_tokens, usage.output_tokens);
 
   // Log the overseer response
@@ -154,6 +161,8 @@ async function debouncedObserveTurn(
   turn: PendingBatch["turns"][0]
 ): Promise<string> {
   // Always store events immediately (full content, no truncation)
+  log1("observe_turn:", sessionId);
+  log2("User prompt:", turn.user_prompt.slice(0, 200));
   insertEvent(db, sessionId, "user", turn.user_prompt);
   insertEvent(db, sessionId, "assistant", turn.assistant_response);
   if (turn.tool_results) {
@@ -172,6 +181,7 @@ async function debouncedObserveTurn(
   // Check if a Haiku call is already in-flight for this session
   const existing = inFlightSessions.get(sessionId);
   if (existing) {
+    log1("Batching turn — Haiku call in-flight for", sessionId);
     // Batch this turn — it will be processed after the in-flight call returns
     let batch = pendingBatches.get(sessionId);
     if (!batch) {
@@ -194,6 +204,7 @@ async function debouncedObserveTurn(
     // Check if there are pending batched calls
     const batch = pendingBatches.get(sessionId);
     if (batch && batch.turns.length > 0) {
+      log1("Processing batched turns:", batch.turns.length, "for", sessionId);
       pendingBatches.delete(sessionId);
       // Fire one more Haiku call with combined context
       const batchPromise = executeHaikuCall(sessionId, batch.turns);
@@ -425,10 +436,12 @@ server.addTool({
 Session events:
 ${eventText}`;
 
+    log1("summarize_session:", session_id, `(${events.length} events)`);
     const { text: summary, usage } = await callHaiku(
       "You are a concise session summarizer. Produce a brief summary of the coding session.",
       summaryPrompt
     );
+    log2("Summary token usage: in=", usage.input_tokens, "out=", usage.output_tokens);
     insertTokenUsage(db, session_id, usage.input_tokens, usage.output_tokens);
 
     upsertSessionSummary(db, session_id, summary);
@@ -551,6 +564,7 @@ server.addTool({
     "Get health and usage statistics for the haiku-overseer server.",
   parameters: z.object({}),
   execute: async () => {
+    log1("get_health called");
     // DB file size
     let dbSizeMb = 0;
     try {
@@ -624,4 +638,5 @@ process.on("SIGINT", () => {
   } catch {}
 });
 
+log1("haiku-overseer v3.0.0 starting");
 server.start({ transportType: "stdio" });
