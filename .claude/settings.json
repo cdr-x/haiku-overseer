@@ -11,5 +11,10 @@
         ]
       }
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "node hooks/statusline.cjs",
+    "padding": 1
   }
 }
