@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CLAUDE_PROJECT_DIR/hooks/capture-turn.cjs\"",
+            "command": "node hooks/capture-turn.cjs",
             "timeout": 10
           }
         ]
