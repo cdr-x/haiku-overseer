@@ -14,7 +14,7 @@ process.stdin.on("end", () => {
       return;
     }
 
-    const db = new Database(dbPath, { readonly: true });
+    const db = new Database(dbPath);
 
     const usage = db.prepare(
       "SELECT COALESCE(SUM(input_tokens),0) as inp, COALESCE(SUM(output_tokens),0) as out, COUNT(*) as cnt FROM token_usage"
