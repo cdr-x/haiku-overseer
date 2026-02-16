@@ -112,7 +112,7 @@ try {
     ).get(sessionId);
     if (taskVar && taskVar.var_meta) {
       const meta = JSON.parse(taskVar.var_meta);
-      taskPreview = (meta.preview || "").slice(0, 40);
+      taskPreview = (meta.preview || "");
     }
   } catch {}
 
@@ -140,7 +140,7 @@ try {
     const shown = previewLines.slice(0, maxLines);
     for (let i = 0; i < shown.length; i++) {
       const prefix = i < shown.length - 1 ? "\u251C" : "\u2514";
-      const line = shown[i].trim().slice(0, 120);
+      const line = shown[i].trim();
       console.log(`\x1b[33m  ${prefix} ${line}\x1b[0m`);
     }
     if (previewLines.length > maxLines) {
@@ -154,7 +154,7 @@ try {
     const shown = previewLines.slice(0, maxLines);
     for (let i = 0; i < shown.length; i++) {
       const prefix = i < shown.length - 1 ? "\u251C" : "\u2514";
-      const line = shown[i].trim().slice(0, 120);
+      const line = shown[i].trim();
       console.log(`\x1b[33m  ${prefix} ${line}\x1b[0m`);
     }
     if (previewLines.length > maxLines) {
