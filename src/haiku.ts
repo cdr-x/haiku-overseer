@@ -4,7 +4,12 @@ const client = new Anthropic();
 
 export interface HaikuResponse {
   text: string;
-  usage: { input_tokens: number; output_tokens: number };
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+  };
 }
 
 export async function callHaiku(
@@ -20,5 +25,13 @@ export async function callHaiku(
 
   const block = response.content[0];
   const text = block.type === "text" ? block.text : "";
-  return { text, usage: response.usage };
+  return {
+    text,
+    usage: {
+      input_tokens: response.usage.input_tokens,
+      output_tokens: response.usage.output_tokens,
+      cache_creation_input_tokens: (response.usage as any).cache_creation_input_tokens ?? 0,
+      cache_read_input_tokens: (response.usage as any).cache_read_input_tokens ?? 0,
+    },
+  };
 }

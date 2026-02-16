@@ -15,6 +15,16 @@ import {
   getRecentSummaries,
   insertTokenUsage,
   getTotalTokenUsage,
+  getAllContextVars,
+  getContextVarsByNames,
+  deleteContextVar,
+  upsertLastAdvisory,
+  insertMicroSummary,
+  getRecentMicroSummaries,
+  getMicroSummaryCount,
+  searchTurns,
+  getTurnRange,
+  listSessions,
 } from "./db.js";
 import { callHaiku } from "./haiku.js";
 import { log1, log2 } from "./logger.js";
@@ -55,10 +65,21 @@ Respond with a short advisory block. Focus on what's most important RIGHT NOW.
 If there's nothing useful to add, respond with just: "LGTM"${claudeMd ? `\n\nProject rules (CLAUDE.md):\n${claudeMd}` : ""}`;
 
 function buildEventLog(sessionId: string): string {
-  const events = getRecentEvents(db, sessionId, 15).reverse();
-  if (events.length === 0) return "(no prior events)";
+  // Use micro-summaries for older context + recent raw events
+  const microSummaries = getRecentMicroSummaries(db, sessionId, 3).reverse();
+  const events = getRecentEvents(db, sessionId, 8).reverse();
 
-  return events
+  if (microSummaries.length === 0 && events.length === 0) return "(no prior events)";
+
+  let log = "";
+
+  if (microSummaries.length > 0) {
+    log += "Earlier context (summaries):\n";
+    log += microSummaries.map(s => `[summary ${s.turn_range}] ${s.summary}`).join("\n");
+    log += "\n\nRecent events:\n";
+  }
+
+  log += events
     .map((e) => {
       const meta = e.meta ? ` [${e.meta}]` : "";
       const content =
@@ -66,6 +87,42 @@ function buildEventLog(sessionId: string): string {
       return `[${e.role}${meta}] ${content}`;
     })
     .join("\n");
+
+  return log;
+}
+
+// Micro-summary generation: every MICRO_SUMMARY_INTERVAL observe_turn calls
+const MICRO_SUMMARY_INTERVAL = 10;
+const turnCounters = new Map<string, number>();
+
+async function maybeGenerateMicroSummary(sessionId: string): Promise<void> {
+  const count = (turnCounters.get(sessionId) || 0) + 1;
+  turnCounters.set(sessionId, count);
+
+  if (count % MICRO_SUMMARY_INTERVAL !== 0) return;
+
+  const events = getRecentEvents(db, sessionId, MICRO_SUMMARY_INTERVAL).reverse();
+  if (events.length < 5) return;
+
+  const eventText = events.map(e => {
+    const content = e.content.length > 300 ? e.content.slice(0, 300) + "..." : e.content;
+    return `[${e.role}] ${content}`;
+  }).join("\n");
+
+  const turnRange = `${count - MICRO_SUMMARY_INTERVAL + 1}-${count}`;
+  log1("Generating micro-summary for turns", turnRange);
+
+  try {
+    const { text: summary, usage } = await callHaiku(
+      "Summarize this block of coding session events in 2-3 sentences. Focus on what was done, any errors, and decisions made.",
+      eventText
+    );
+    insertMicroSummary(db, sessionId, turnRange, summary);
+    insertTokenUsage(db, sessionId, usage.input_tokens, usage.output_tokens, usage.cache_creation_input_tokens, usage.cache_read_input_tokens);
+    log1("Micro-summary stored:", summary.slice(0, 80));
+  } catch (err) {
+    log1("Micro-summary generation failed:", String(err));
+  }
 }
 
 // --- Debounce / Batching for rapid observe_turn calls ---
@@ -133,14 +190,15 @@ async function executeHaikuCall(
   log2("Haiku prompt length:", userMsg.length);
   const { text: haikuResponse, usage } = await callHaiku(SYSTEM_PROMPT, userMsg);
   log1("Haiku response:", haikuResponse.trim() === "LGTM" ? "LGTM" : `Advisory (${haikuResponse.length} chars)`);
-  log2("Token usage: in=", usage.input_tokens, "out=", usage.output_tokens);
-  insertTokenUsage(db, sessionId, usage.input_tokens, usage.output_tokens);
+  log2("Token usage: in=", usage.input_tokens, "out=", usage.output_tokens, "cache_create=", usage.cache_creation_input_tokens, "cache_read=", usage.cache_read_input_tokens);
+  insertTokenUsage(db, sessionId, usage.input_tokens, usage.output_tokens, usage.cache_creation_input_tokens, usage.cache_read_input_tokens);
 
   // Log the overseer response
   const firstTurn = turns[0];
   if (haikuResponse.trim() === "LGTM") {
     insertEvent(db, sessionId, "injection", "LGTM");
     insertPrompt(db, sessionId, firstTurn.user_prompt, null, haikuResponse);
+    upsertLastAdvisory(db, sessionId, "LGTM", true);
     return "";
   }
 
@@ -153,6 +211,7 @@ async function executeHaikuCall(
     injection,
     haikuResponse
   );
+  upsertLastAdvisory(db, sessionId, haikuResponse, false);
   return injection;
 }
 
@@ -177,6 +236,9 @@ async function debouncedObserveTurn(
   if (turn.git_diff) {
     insertEvent(db, sessionId, "diff", turn.git_diff);
   }
+
+  // Fire-and-forget micro-summary check (don't block the main flow)
+  maybeGenerateMicroSummary(sessionId).catch(() => {});
 
   // Check if a Haiku call is already in-flight for this session
   const existing = inFlightSessions.get(sessionId);
@@ -441,8 +503,8 @@ ${eventText}`;
       "You are a concise session summarizer. Produce a brief summary of the coding session.",
       summaryPrompt
     );
-    log2("Summary token usage: in=", usage.input_tokens, "out=", usage.output_tokens);
-    insertTokenUsage(db, session_id, usage.input_tokens, usage.output_tokens);
+    log2("Summary token usage: in=", usage.input_tokens, "out=", usage.output_tokens, "cache_create=", usage.cache_creation_input_tokens, "cache_read=", usage.cache_read_input_tokens);
+    insertTokenUsage(db, session_id, usage.input_tokens, usage.output_tokens, usage.cache_creation_input_tokens, usage.cache_read_input_tokens);
 
     upsertSessionSummary(db, session_id, summary);
 
@@ -590,11 +652,13 @@ server.addTool({
       db.prepare(`SELECT COUNT(DISTINCT session_id) as cnt FROM events`).get() as { cnt: number }
     ).cnt;
 
-    // Token usage
+    // Token usage (Haiku 4.5 pricing: $0.80/M input, $4/M output, $1/M cache write, $0.08/M cache read)
     const tokenUsage = getTotalTokenUsage(db);
     const estimatedCost =
       (tokenUsage.total_input / 1_000_000) * 0.8 +
-      (tokenUsage.total_output / 1_000_000) * 4;
+      (tokenUsage.total_output / 1_000_000) * 4 +
+      (tokenUsage.total_cache_creation / 1_000_000) * 1.0 +
+      (tokenUsage.total_cache_read / 1_000_000) * 0.08;
 
     // Last error
     let lastError: { content: string; created_at: string } | null = null;
@@ -614,11 +678,180 @@ server.addTool({
         token_usage: {
           total_input_tokens: tokenUsage.total_input,
           total_output_tokens: tokenUsage.total_output,
+          total_cache_creation_tokens: tokenUsage.total_cache_creation,
+          total_cache_read_tokens: tokenUsage.total_cache_read,
           total_api_calls: tokenUsage.call_count,
           estimated_cost_usd:
             Math.round(estimatedCost * 10000) / 10000,
         },
         last_error: lastError,
+      },
+      null,
+      2
+    );
+  },
+});
+
+// Tool 8: get_context_vars — retrieve RLM-inspired context variables
+server.addTool({
+  name: "get_context_vars",
+  description:
+    "Retrieve context variables stored by hooks. Returns structured session state (files modified, errors, current task, decisions, etc.).",
+  parameters: z.object({
+    session_id: z
+      .string()
+      .default("default")
+      .describe("Session to query"),
+    var_names: z
+      .array(z.string())
+      .optional()
+      .describe("Specific variable names to retrieve (e.g. ['FILES_MODIFIED', 'ERROR_PATTERNS']). Omit for all."),
+  }),
+  execute: async (params) => {
+    const { session_id, var_names } = params;
+    log1("get_context_vars:", session_id, var_names ? `[${var_names.join(",")}]` : "(all)");
+
+    const vars = var_names && var_names.length > 0
+      ? getContextVarsByNames(db, session_id, var_names)
+      : getAllContextVars(db, session_id);
+
+    const result: Record<string, { value: unknown; meta: unknown; updated_at: string }> = {};
+    for (const v of vars) {
+      let value: unknown = v.var_value;
+      let meta: unknown = v.var_meta;
+      try { value = JSON.parse(v.var_value); } catch {}
+      try { if (v.var_meta) meta = JSON.parse(v.var_meta); } catch {}
+      result[v.var_name] = { value, meta, updated_at: v.updated_at };
+    }
+
+    return JSON.stringify(result, null, 2);
+  },
+});
+
+// Tool 9: clear_context_vars — reset stale context variables
+server.addTool({
+  name: "clear_context_vars",
+  description:
+    "Clear (delete) context variables that are no longer relevant. Use after a git commit to reset FILES_MODIFIED, or after fixing errors to reset ERROR_PATTERNS and ERROR_LOOP.",
+  parameters: z.object({
+    session_id: z
+      .string()
+      .default("default")
+      .describe("Session to clear vars for"),
+    var_names: z
+      .array(z.string())
+      .describe("Variable names to clear (e.g. ['FILES_MODIFIED', 'ERROR_PATTERNS', 'ERROR_LOOP'])"),
+  }),
+  execute: async (params) => {
+    const { session_id, var_names } = params;
+    log1("clear_context_vars:", session_id, `[${var_names.join(",")}]`);
+
+    const cleared: string[] = [];
+    for (const name of var_names) {
+      deleteContextVar(db, session_id, name);
+      cleared.push(name);
+    }
+
+    return JSON.stringify({ cleared, message: `Cleared ${cleared.length} context variable(s)` });
+  },
+});
+
+// Tool 10: search_transcript — FTS5 search across turns
+server.addTool({
+  name: "search_transcript",
+  description:
+    "Full-text search across all session transcripts. Returns matching turns with highlighted snippets. " +
+    "Uses SQLite FTS5 — supports AND, OR, NOT, prefix queries (e.g. 'error AND database', 'fix*').",
+  parameters: z.object({
+    query: z.string().describe("FTS5 search query (e.g. 'authentication error', 'refactor AND test')"),
+    session_id: z
+      .string()
+      .optional()
+      .describe("Limit search to a specific session. Omit to search all sessions."),
+    limit: z.number().min(1).max(50).default(10).describe("Max results to return"),
+    offset: z.number().min(0).default(0).describe("Skip first N results for pagination"),
+  }),
+  execute: async (params) => {
+    const { query, session_id, limit, offset } = params;
+    log1("search_transcript:", query, session_id || "(all sessions)");
+
+    try {
+      const results = searchTurns(db, query, session_id, limit, offset);
+      return JSON.stringify(
+        {
+          query,
+          count: results.length,
+          results: results.map((r) => ({
+            turn_id: r.id,
+            session_id: r.session_id,
+            snippet_prompt: r.snippet_prompt,
+            snippet_response: r.snippet_response,
+            created_at: r.created_at,
+          })),
+        },
+        null,
+        2
+      );
+    } catch (err) {
+      return JSON.stringify({ error: String(err), query });
+    }
+  },
+});
+
+// Tool 11: get_turns — retrieve raw turns paginated
+server.addTool({
+  name: "get_turns",
+  description:
+    "Retrieve raw conversation turns for a session, paginated. Returns full user prompts and assistant responses in chronological order.",
+  parameters: z.object({
+    session_id: z.string().default("default").describe("Session to retrieve turns from"),
+    limit: z.number().min(1).max(100).default(20).describe("Number of turns to return"),
+    offset: z.number().min(0).default(0).describe("Skip first N turns for pagination"),
+  }),
+  execute: async (params) => {
+    const { session_id, limit, offset } = params;
+    log1("get_turns:", session_id, `limit=${limit} offset=${offset}`);
+
+    const turns = getTurnRange(db, session_id, limit, offset);
+    return JSON.stringify(
+      {
+        session_id,
+        count: turns.length,
+        offset,
+        turns: turns.map((t) => ({
+          id: t.id,
+          user_prompt: t.user_prompt,
+          assistant_response: t.assistant_response,
+          created_at: t.created_at,
+        })),
+      },
+      null,
+      2
+    );
+  },
+});
+
+// Tool 12: list_sessions — list sessions with metadata
+server.addTool({
+  name: "list_sessions",
+  description:
+    "List all sessions with turn counts, time ranges, and summaries. Useful for finding previous sessions to search or review.",
+  parameters: z.object({
+    limit: z.number().min(1).max(50).default(20).describe("Max sessions to return"),
+  }),
+  execute: async (params) => {
+    log1("list_sessions: limit=", params.limit);
+    const sessions = listSessions(db, params.limit);
+    return JSON.stringify(
+      {
+        count: sessions.length,
+        sessions: sessions.map((s) => ({
+          session_id: s.session_id,
+          turn_count: s.turn_count,
+          first_turn: s.first_turn,
+          last_turn: s.last_turn,
+          summary: s.summary,
+        })),
       },
       null,
       2

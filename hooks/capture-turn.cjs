@@ -1,15 +1,16 @@
 // hooks/capture-turn.cjs
 // Claude Code Stop hook: captures full user prompt + assistant response from transcript
+// Also tracks file modifications as context variables
 const fs = require("fs");
 const path = require("path");
 const Database = require("better-sqlite3");
+const { openDb: openCvDb, upsertContextVar, getContextVar } = require("./lib/context-vars.cjs");
 
 let input = "";
 process.stdin.on("data", (d) => (input += d));
 process.stdin.on("end", () => {
   try {
     const data = JSON.parse(input);
-    if (data.stop_hook_active) process.exit(0);
 
     const transcriptPath = data.transcript_path;
     const sessionId = data.session_id || "default";
@@ -72,6 +73,77 @@ process.stdin.on("end", () => {
       "INSERT INTO turns (session_id, user_prompt, assistant_response) VALUES (?, ?, ?)"
     ).run(sessionId, lastUser, lastAssistant);
     db.close();
+
+    // Deterministic file tracking: parse assistant response for Write/Edit file paths
+    try {
+      const cvDb = openCvDb(data.cwd);
+      const filePatterns = [
+        /(?:Write|Edit).*?file[_\s]*path['":\s]+['"]?([^\s'",}]+)/gi,
+        /(?:Created|Updated|Wrote|Edited).*?(?:file|at)[:\s]+['"]?([^\s'",}]+\.\w+)/gi,
+      ];
+      let filesModified = {};
+      const existingFiles = getContextVar(cvDb, sessionId, "FILES_MODIFIED");
+      if (existingFiles) {
+        try { filesModified = JSON.parse(existingFiles.var_value); } catch {}
+      }
+
+      let found = false;
+      for (const pattern of filePatterns) {
+        let match;
+        while ((match = pattern.exec(lastAssistant)) !== null) {
+          const filePath = match[1];
+          if (filePath && filePath.length > 2 && filePath.includes(".")) {
+            filesModified[filePath] = {
+              action: "detected",
+              timestamp: new Date().toISOString(),
+            };
+            found = true;
+          }
+        }
+      }
+
+      if (found) {
+        const fileCount = Object.keys(filesModified).length;
+        upsertContextVar(
+          cvDb,
+          sessionId,
+          "FILES_MODIFIED",
+          JSON.stringify(filesModified),
+          JSON.stringify({ count: fileCount, source: "stop-hook" })
+        );
+      }
+
+      // Optional AI analysis gated by env var
+      if (process.env.HAIKU_STOP_ANALYSIS === "true") {
+        try {
+          const { callHaiku } = require("./lib/haiku-client.cjs");
+          const analysisPrompt = `Extract from this assistant response:
+1. CURRENT_TASK: What is being worked on (1 sentence)
+2. DECISIONS: Any decisions made (array of strings)
+
+Response: ${lastAssistant.slice(0, 2000)}
+
+Respond with ONLY valid JSON: {"CURRENT_TASK": "...", "DECISIONS": [...]}`;
+          const result = callHaiku("Extract session state. JSON only.", analysisPrompt);
+          result.then((text) => {
+            try {
+              const parsed = JSON.parse(text);
+              if (parsed.CURRENT_TASK) {
+                upsertContextVar(cvDb, sessionId, "CURRENT_TASK", parsed.CURRENT_TASK,
+                  JSON.stringify({ preview: parsed.CURRENT_TASK.slice(0, 80), source: "stop-analysis" }));
+              }
+              if (parsed.DECISIONS && Array.isArray(parsed.DECISIONS) && parsed.DECISIONS.length > 0) {
+                upsertContextVar(cvDb, sessionId, "DECISIONS", JSON.stringify(parsed.DECISIONS),
+                  JSON.stringify({ count: parsed.DECISIONS.length, source: "stop-analysis" }));
+              }
+            } catch {}
+            cvDb.close();
+          }).catch(() => cvDb.close());
+        } catch { cvDb.close(); }
+      } else {
+        cvDb.close();
+      }
+    } catch {}
   } catch (err) {
     // Silent failure — don't block Claude Code
     process.exit(0);

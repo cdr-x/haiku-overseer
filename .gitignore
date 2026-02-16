@@ -1,3 +1,4 @@
 node_modules/
 dist/
 .haiku-overseer/
+.claude/settings.local.json
