@@ -37,13 +37,13 @@ try {
   // Count turns: current session from events (real-time) + past sessions from turns table
   let turns = 0;
   try {
-    // Current session turns: count user events as a proxy (observe_turn writes these in real-time)
+    // Current session turns: count user events (observe_turn may use "default" or real session ID)
     const sessionTurns = db.prepare(
-      "SELECT COUNT(*) as c FROM events WHERE session_id = ? AND role = 'user'"
+      "SELECT COUNT(*) as c FROM events WHERE session_id IN (?, 'default') AND role = 'user'"
     ).get(sessionId).c;
-    // Past sessions: total from turns table minus any already counted from current session events
+    // Past sessions: total from turns table minus current session IDs
     const pastTurns = db.prepare(
-      "SELECT COUNT(*) as c FROM turns WHERE session_id != ?"
+      "SELECT COUNT(*) as c FROM turns WHERE session_id NOT IN (?, 'default')"
     ).get(sessionId).c;
     turns = sessionTurns + pastTurns;
   } catch {}
@@ -52,13 +52,41 @@ try {
     "SELECT COUNT(*) as c FROM events WHERE role='error' AND created_at > datetime('now','-5 minutes')"
   ).get().c;
 
-  // Use real session ID for advisory lookup
+  // Check for active thinking state (streaming Haiku response)
+  let isThinking = false;
+  let thinkingPreview = "";
+  let thinkingDone = false;
+  let thinkingDonePreview = "";
+  const thinkingPath = path.join(overseerDir, "thinking.json");
+  try {
+    if (fs.existsSync(thinkingPath)) {
+      const raw = fs.readFileSync(thinkingPath, "utf-8");
+      const state = JSON.parse(raw);
+      if ((state.session_id === sessionId || state.session_id === "default") && state.started_at) {
+        if (state.status === "thinking" && Date.now() - state.started_at < 30000) {
+          isThinking = true;
+          thinkingPreview = (state.preview || "").trim();
+        } else if (state.status === "done" && state.completed_at && Date.now() - state.completed_at < 120000) {
+          // Recently completed — show brief "done" indicator
+          thinkingDone = true;
+          thinkingDonePreview = (state.preview || "").trim();
+        }
+      }
+    }
+  } catch {}
+
+  // Advisory lookup: try real session ID, fall back to "default"
   let lastInj = null;
   let isLgtm = true;
   try {
-    const advisory = db.prepare(
+    let advisory = db.prepare(
       "SELECT content, is_lgtm FROM last_advisory WHERE session_id = ?"
     ).get(sessionId);
+    if (!advisory && sessionId !== "default") {
+      advisory = db.prepare(
+        "SELECT content, is_lgtm FROM last_advisory WHERE session_id = 'default'"
+      ).get();
+    }
     if (advisory) {
       lastInj = { content: advisory.content };
       isLgtm = advisory.is_lgtm === 1;
@@ -94,13 +122,46 @@ try {
   ];
   if (varsCount > 0) parts.push(`${varsCount} vars`);
   if (errors > 0) parts.push(`\x1b[31m${errors} err\x1b[0m`);
-  if (isLgtm && lastInj) parts.push("\x1b[32m\u2713\x1b[0m");
+  if (isThinking) {
+    parts.push("\x1b[33m[thinking...]\x1b[0m");
+  } else if (thinkingDone) {
+    parts.push("\x1b[32m[done]\x1b[0m");
+  } else if (isLgtm && lastInj) {
+    parts.push("\x1b[32m\u2713\x1b[0m");
+  }
   if (taskPreview) parts.push(`\x1b[36m${taskPreview}\x1b[0m`);
 
   console.log(parts.join(" | "));
 
-  // Show advisory content across multiple lines when last response wasn't LGTM
-  if (!isLgtm && lastInj) {
+  if (isThinking && thinkingPreview) {
+    // Show streaming preview instead of advisory
+    const previewLines = thinkingPreview.split("\n").filter((l) => l.trim());
+    const maxLines = 4;
+    const shown = previewLines.slice(0, maxLines);
+    for (let i = 0; i < shown.length; i++) {
+      const prefix = i < shown.length - 1 ? "\u251C" : "\u2514";
+      const line = shown[i].trim().slice(0, 120);
+      console.log(`\x1b[33m  ${prefix} ${line}\x1b[0m`);
+    }
+    if (previewLines.length > maxLines) {
+      console.log(`\x1b[33m    ...\x1b[0m`);
+    }
+  } else if (thinkingDone && thinkingDonePreview && thinkingDonePreview !== "LGTM") {
+    // Show recently completed advisory from thinking.json
+    console.log(`\x1b[33m\u26A0 Advisory:\x1b[0m`);
+    const previewLines = thinkingDonePreview.split("\n").filter((l) => l.trim());
+    const maxLines = 6;
+    const shown = previewLines.slice(0, maxLines);
+    for (let i = 0; i < shown.length; i++) {
+      const prefix = i < shown.length - 1 ? "\u251C" : "\u2514";
+      const line = shown[i].trim().slice(0, 120);
+      console.log(`\x1b[33m  ${prefix} ${line}\x1b[0m`);
+    }
+    if (previewLines.length > maxLines) {
+      console.log(`\x1b[33m    (+${previewLines.length - maxLines} more lines)\x1b[0m`);
+    }
+  } else if (!isLgtm && lastInj) {
+    // Show advisory content across multiple lines when last response wasn't LGTM
     console.log(`\x1b[33m\u26A0 Last advisory:\x1b[0m`);
     const lines = lastInj.content.split("\n").filter((l) => l.trim());
     const maxLines = 8;

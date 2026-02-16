@@ -29,6 +29,53 @@ import {
 import { callHaiku } from "./haiku.js";
 import { log1, log2 } from "./logger.js";
 
+// --- Thinking state: stream Haiku progress to a JSON file for statusline ---
+const THINKING_PATH = path.join(
+  process.env.HAIKU_DB_PATH
+    ? path.dirname(process.env.HAIKU_DB_PATH)
+    : path.join(process.cwd(), ".haiku-overseer"),
+  "thinking.json"
+);
+
+function writeThinkingState(
+  sessionId: string,
+  preview: string,
+  startedAt: number
+): void {
+  const data = JSON.stringify({
+    session_id: sessionId,
+    status: "thinking",
+    preview,
+    started_at: startedAt,
+  });
+  const tmpPath = THINKING_PATH + ".tmp";
+  try {
+    fs.writeFileSync(tmpPath, data, "utf-8");
+    fs.renameSync(tmpPath, THINKING_PATH);
+  } catch {
+    // Best-effort — statusline will just show stale data
+  }
+}
+
+function writeThinkingDone(
+  sessionId: string,
+  response: string,
+  startedAt: number
+): void {
+  const data = JSON.stringify({
+    session_id: sessionId,
+    status: "done",
+    preview: response,
+    started_at: startedAt,
+    completed_at: Date.now(),
+  });
+  const tmpPath = THINKING_PATH + ".tmp";
+  try {
+    fs.writeFileSync(tmpPath, data, "utf-8");
+    fs.renameSync(tmpPath, THINKING_PATH);
+  } catch {}
+}
+
 // Database: project-local or HAIKU_DB_PATH env var
 const dbPath =
   process.env.HAIKU_DB_PATH ||
@@ -188,7 +235,22 @@ async function executeHaikuCall(
   }Latest turn${turns.length > 1 ? "s" : ""}:\n${latestSection}`;
 
   log2("Haiku prompt length:", userMsg.length);
-  const { text: haikuResponse, usage } = await callHaiku(SYSTEM_PROMPT, userMsg);
+  const startedAt = Date.now();
+  writeThinkingState(sessionId, "", startedAt);
+
+  let haikuResponse: string;
+  let usage: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number };
+  try {
+    const result = await callHaiku(SYSTEM_PROMPT, userMsg, {
+      onChunk: (snapshot) => writeThinkingState(sessionId, snapshot, startedAt),
+    });
+    haikuResponse = result.text;
+    usage = result.usage;
+  } catch (err) {
+    writeThinkingDone(sessionId, "", startedAt);
+    throw err;
+  }
+  writeThinkingDone(sessionId, haikuResponse, startedAt);
   log1("Haiku response:", haikuResponse.trim() === "LGTM" ? "LGTM" : `Advisory (${haikuResponse.length} chars)`);
   log2("Token usage: in=", usage.input_tokens, "out=", usage.output_tokens, "cache_create=", usage.cache_creation_input_tokens, "cache_read=", usage.cache_read_input_tokens);
   insertTokenUsage(db, sessionId, usage.input_tokens, usage.output_tokens, usage.cache_creation_input_tokens, usage.cache_read_input_tokens);
