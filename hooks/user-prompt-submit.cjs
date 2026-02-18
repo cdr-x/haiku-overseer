@@ -1,6 +1,30 @@
 // hooks/user-prompt-submit.cjs
 // UserPromptSubmit hook: injects context variables + RLM context into additionalContext
+const fs = require("fs");
+const path = require("path");
 const { openDb, getAllContextVars, getContextVar, upsertContextVar, deleteContextVar } = require("./lib/context-vars.cjs");
+
+function hookLog(cwd, section, err, context) {
+  const msg = `[UserPromptSubmit:${section}] ${err.message || err}`;
+  process.stderr.write(msg + (context ? ` | ${context}` : "") + "\n");
+  try {
+    const logDir = path.join(cwd || ".", ".haiku-overseer");
+    const logPath = path.join(logDir, "hook-errors.log");
+    try {
+      const stat = fs.statSync(logPath);
+      if (stat.size > 100 * 1024) {
+        const content = fs.readFileSync(logPath, "utf-8");
+        fs.writeFileSync(logPath, content.slice(-50 * 1024));
+      }
+    } catch {}
+    const entry = JSON.stringify({
+      hook: "UserPromptSubmit", section, error: err.message || String(err),
+      stack: err.stack || null, context: context || null,
+      timestamp: new Date().toISOString(),
+    }) + "\n";
+    fs.appendFileSync(logPath, entry);
+  } catch {}
+}
 
 let input = "";
 process.stdin.on("data", (d) => (input += d));
@@ -108,7 +132,7 @@ process.stdin.on("end", async () => {
 
           rlmPreview = `RLM: ${rlmResult.chunks ? rlmResult.chunks.length : 0}/${rlmResult.totalChunks} chunks`;
           if (hasCommands) {
-            rlmPreview += `, cmds: ${rlmResult.suggestedCommands.map(c => c.name).join(",")}`;
+            rlmPreview += `, cmds: ${rlmResult.suggestedCommands.map(c => c.name.startsWith("/") ? c.name : `/${c.name}`).join(" ")}`;
           }
 
           // Drift detection: compare current injected chunks against previous turn
@@ -147,11 +171,13 @@ process.stdin.on("end", async () => {
                 JSON.stringify(currentIds),
                 JSON.stringify({ count: currentIds.length, timestamp: new Date().toISOString() })
               );
-            } catch {}
+            } catch (err) {
+              hookLog(data.cwd, "drift-detection", err, `session=${sessionId}`);
+            }
           }
         }
-      } catch {
-        // RLM retrieval failed silently — don't block the hook
+      } catch (err) {
+        hookLog(data.cwd, "rlm-retrieval", err, `prompt_len=${userPrompt.length}`);
       }
     }
 
@@ -171,7 +197,9 @@ process.stdin.on("end", async () => {
       } else {
         deleteContextVar(db, sessionId, "SUGGESTED_COMMANDS");
       }
-    } catch {}
+    } catch (err) {
+      hookLog(data.cwd, "suggested-commands", err, `session=${sessionId}`);
+    }
     db.close();
 
     // Combine all context
@@ -198,7 +226,9 @@ process.stdin.on("end", async () => {
       },
     };
     console.log(JSON.stringify(output));
-  } catch {
+  } catch (err) {
+    const cwd = (() => { try { return JSON.parse(input).cwd; } catch { return null; } })();
+    hookLog(cwd, "top-level", err, `input_len=${input.length}`);
     process.exit(0);
   }
 });

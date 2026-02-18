@@ -18,7 +18,7 @@ function ensureStream(): fs.WriteStream {
   return logStream;
 }
 
-export type RlmLogCategory = "chunk" | "embed" | "retrieve" | "skill" | "inject" | "bellman";
+export type RlmLogCategory = "chunk" | "embed" | "retrieve" | "skill" | "inject" | "bellman" | "hnsw";
 
 export function rlmLog(category: RlmLogCategory, message: string, data?: unknown): void {
   const stream = ensureStream();

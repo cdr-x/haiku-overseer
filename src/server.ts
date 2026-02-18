@@ -25,6 +25,8 @@ import {
   searchTurns,
   getTurnRange,
   listSessions,
+  getChunkStats,
+  checkDbIntegrity,
 } from "./db.js";
 import { callHaiku } from "./haiku.js";
 import { log1, log2 } from "./logger.js";
@@ -735,12 +737,28 @@ server.addTool({
       .get() as { content: string; created_at: string } | undefined;
     if (errorRow) lastError = errorRow;
 
+    // RLM stats
+    let rlm: { total_chunks: number; stale_chunks: number; avg_utility: number; total_skills: number } | null = null;
+    try {
+      rlm = getChunkStats(db);
+    } catch {}
+
+    // DB integrity status
+    let dbStatus: "healthy" | "degraded" | "unhealthy" = "healthy";
+    try {
+      dbStatus = checkDbIntegrity(db);
+    } catch {
+      dbStatus = "unhealthy";
+    }
+
     return JSON.stringify(
       {
+        db_status: dbStatus,
         db_size_mb: dbSizeMb,
         total_events: totalEvents,
         total_turns: totalTurns,
         session_count: sessionCount,
+        rlm,
         token_usage: {
           total_input_tokens: tokenUsage.total_input,
           total_output_tokens: tokenUsage.total_output,

@@ -58,7 +58,7 @@ process.stdin.on("end", () => {
               );
               blockDb.close();
 
-              const cmdNames = uninvoked.map(c => `/${c.name}`).join(", ");
+              const cmdNames = uninvoked.map(c => c.name.startsWith("/") ? c.name : `/${c.name}`).join(" ");
               console.log(JSON.stringify({
                 decision: "block",
                 reason: `You have suggested command(s) ${cmdNames} that weren't run. Please invoke with the Skill tool before finishing, or explicitly explain why they're not needed.`,

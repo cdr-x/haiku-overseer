@@ -2,45 +2,42 @@
 description: "Use this command to analyze, implement, and test research paper techniques in the haiku-overseer plugin codebase"
 ---
 
-# /implement-paper-techniques
+# Implement Paper Techniques
 
-Analyzes current codebase implementation status against research papers, identifies gaps, and implements missing techniques from DAPO, MemRL, and related research with proper logging and testing.
+Analyze the current state of the codebase against research paper formulas, implement missing techniques, and verify they're working correctly through logging and testing.
 
 ## Instructions
 
 ### Step 1: Audit Current Implementation
-Read the core files (rlm.ts, embeddings.ts, paper-formulas.ts, haiku.ts, db.ts, chunking.ts) and produce a detailed gap analysis showing:
-- What paper techniques ARE already implemented
-- What specific mechanisms are NOT yet implemented
-- Which formulas or algorithms are partially complete
+Read the key source files (src/rlm.ts, src/embeddings.ts, src/paper-formulas.ts, src/haiku.ts, src/db.ts, src/chunking.ts) and identify:
+- Which paper techniques are already implemented
+- Which specific mechanisms are NOT yet implemented
+- What gaps exist between the research and current code
 
-### Step 2: Prioritize Implementation Items
-From the identified gaps, prioritize by:
-1. Bugfixes and quick wins (low effort, high impact)
-2. Core momentum techniques (Titans, DAPO, MemRL)
-3. Safety and reward shaping enhancements
-4. Persistent memory and logging infrastructure
+### Step 2: Implement Missing Techniques
+For each missing or incomplete technique:
+- Add the formula/logic to the appropriate file
+- Update paper-formulas.ts with constants if needed
+- Implement in the relevant execution path (fast path or slow path for utilities)
+- Ensure append-mode logging captures the execution
 
-### Step 3: Implement Selected Items
-For each prioritized item:
-- Add code to appropriate file (formulas → paper-formulas.ts, retrieval → rlm.ts, etc.)
-- Include append-mode logging to `.haiku-overseer/conversation.log` for private exchanges
-- Ensure clean TypeScript build with no errors
+### Step 3: Add Logging & Testing
+- Implement append-mode file logging to capture private exchanges (system prompts, user→model exchanges, consolidation calls, convergence stats)
+- Log to `.haiku-overseer/conversation.log` or appropriate audit file
+- Create tests that verify private conversations are happening and being recorded
+- Check that all exchanges produce expected output in the log file
 
-### Step 4: Add Verification Tests
-Create tests that verify:
-- Private exchanges between haiku and system are logged correctly
-- Convergence statistics and round data appear in conversation.log
-- Formula calculations match paper specifications
-- Reward propagation follows specified paths (fast/slow)
-
-### Step 5: Document Cross-System Ideas
-Identify useful patterns from related systems (@agentic-flow, @claude-flow, @docs/) that could enhance the haiku-overseer plugin architecture.
+### Step 4: Clean Build & Validation
+- Perform a clean build
+- Verify no compilation errors
+- Confirm logging files exist and contain expected data
+- Test that reward shaping, memory updates, and convergence tracking work end-to-end
 
 ## Output Format
 
-Deliver:
-1. **Gap Analysis Report** — Table of implemented vs. missing techniques
-2. **Implementation Summary** — Files modified, functions added/changed, build status
-3. **Test Results** — Verification that conversation.log contains expected private exchanges
-4. **Architecture Notes** — Recommended ideas from other systems to integrate next
+Provide:
+1. Summary of implemented techniques with line references
+2. List of any remaining gaps
+3. Log file excerpts showing successful private exchanges
+4. Build status confirmation
+5. Test results confirming logging functionality

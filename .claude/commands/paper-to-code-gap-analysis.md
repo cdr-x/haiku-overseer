@@ -1,48 +1,36 @@
-```markdown
 ---
-description: "Use this command to analyze research papers and extract algorithmic improvements applicable to the MCP/RLM plugin codebase."
+description: "Use this command when you need to analyze code implementations against research papers and identify gaps between theory and practice."
 ---
 
 # Paper-to-Code Gap Analysis
 
-Reads academic papers from the docs/ directory, extracts key algorithms and techniques, performs a comprehensive gap analysis against the current codebase, and identifies specific implementation opportunities.
+Analyzes the current state of implementation across multiple files to identify which research paper techniques are already implemented and which mechanisms are missing.
 
 ## Instructions
+### Step 1: Identify Target Files
+Request a list of source files to analyze (e.g., src/rlm.ts, src/embeddings.ts, src/paper-formulas.ts, src/haiku.ts, src/db.ts, src/chunking.ts).
 
-### Step 1: Locate and Read All Papers
-Read all .mhtml and research documents in the user's docs/ directory. Common papers include:
-- Recursive Language Models (RLMs)
-- MemRL: Self-Evolving Agents via Runtime Reinforcement Learning
-- Titans: Learning to Memorize at Test Time
-- DAPO and RL survey papers
+### Step 2: Read All Files
+Perform a comprehensive read of each file to understand current implementations, data structures, and function signatures.
 
-### Step 2: Extract Key Algorithms
-For each paper, extract:
-- Core algorithms and mathematical formulas
-- Key techniques (e.g., delta thresholds, utility gating, momentum terms)
-- Data structures and control flow patterns
-- Hyperparameter strategies
+### Step 3: Cross-Reference with Papers
+For each research paper technique mentioned (DAPO, MemRL, Titans, Recursive Language Models, etc.), determine:
+- Whether it is implemented
+- Which file(s) contain the implementation
+- Specific mechanism details (e.g., "EMA Q-values", "z-score normalization", "memory_weight column")
 
-### Step 3: Audit Current Codebase
-Comprehensively read all source files (rlm.ts, db.ts, embeddings.ts, chunking.ts, hooks/*.cjs, server.ts) to understand the current implementation state.
+### Step 4: Document Gaps
+Create a structured list of:
+- **Implemented techniques**: With file locations and brief descriptions
+- **Missing mechanisms**: Specific gaps between paper algorithms and codebase (e.g., "no Phase A delta threshold", "no utility gating on skill creation")
+- **Partially implemented**: Features that exist but lack key components
 
-### Step 4: Perform Gap Analysis
-Create a structured comparison identifying:
-- Which paper algorithms are already implemented
-- Which algorithms are missing or partially implemented
-- Priority ranking for missing features (impact vs. complexity)
-- Specific code locations where changes would apply
-
-### Step 5: Deliver Recommendations
-Provide actionable recommendations with:
-- Exact gaps (e.g., "no Phase A delta threshold", "reward signal lacks determinism")
-- Implementation difficulty assessment
-- Suggested code changes with file/function locations
+### Step 5: Recommend Priorities
+Suggest which gaps should be addressed first based on dependency order and impact.
 
 ## Output Format
-
-Deliver a comprehensive gap analysis report including:
-1. Summary table of papers vs. implemented features
-2. Detailed gap descriptions with code references
-3. Prioritized implementation roadmap
-4. Code snippets or pseudocode for recommended improvements
+Return a detailed gap analysis document that lists:
+1. Summary of files analyzed
+2. Table of implemented paper techniques by file
+3. Numbered list of gaps with severity/priority
+4. Recommended implementation order with brief rationales

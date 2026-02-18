@@ -42,6 +42,7 @@ import {
   getContextVar,
 } from "./db.js";
 import { rlmLog } from "./rlm-debug.js";
+import { getOrBuildIndex } from "./hnsw.js";
 
 const anthropicClient = new Anthropic();
 
@@ -214,20 +215,24 @@ export async function classifyAndRetrieve(
     return { instructions: "", suggestedCommands: [], chunks: [], totalChunks };
   }
 
-  // Phase 1: Compute similarity, apply MIN_SIMILARITY floor, take top-20
-  // The floor enforces the MemRL two-phase structure: semantic gating before value-aware selection.
-  const scored = allEmbeddings
-    .map((row) => {
-      const emb = bufferToFloat32(row.embedding);
-      const similarity = cosineSimilarity(queryEmbedding, emb);
-      return { ...row, similarity };
+  // Phase 1: HNSW approximate nearest neighbor search → top candidates
+  // Then apply MIN_SIMILARITY floor. This replaces the O(N) brute-force scan.
+  const hnswIndex = getOrBuildIndex(allEmbeddings);
+  const hnswResults = hnswIndex.search(queryEmbedding, 30); // over-fetch to account for similarity floor
+
+  // Map HNSW results back to full chunk data
+  const embeddingMap = new Map(allEmbeddings.map(e => [e.id, e]));
+  const scored = hnswResults
+    .map(r => {
+      const row = embeddingMap.get(r.id);
+      if (!row) return null;
+      return { ...row, similarity: r.similarity };
     })
-    .filter((s) => s.similarity >= MIN_SIMILARITY) // Phase 1 gate: drop semantically irrelevant chunks
-    .sort((a, b) => b.similarity - a.similarity)
+    .filter((s): s is NonNullable<typeof s> => s !== null && s.similarity >= MIN_SIMILARITY)
     .slice(0, 20); // Top-K1=20
 
   // Phase 2: Re-rank by combined score with surprise novelty bonus (#5) and time decay (#7)
-  // Compute all embeddings for surprise calculation
+  // Compute scored embeddings for surprise calculation
   const allEmbs = scored.map((s) => bufferToFloat32(s.embedding));
   const now = Date.now();
 

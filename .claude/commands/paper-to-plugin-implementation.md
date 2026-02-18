@@ -1,48 +1,53 @@
 ---
-description: "Use this command to analyze and implement research paper concepts into the haiku-overseer plugin architecture"
+description: "Use this command to implement research paper techniques into the haiku-overseer plugin and verify their integration through logging and testing."
 ---
 
 # Paper-to-Plugin Implementation
 
-Analyzes academic papers and research documentation to identify implementable concepts, then structures a phased rollout plan for integrating them into the haiku-overseer plugin system.
+Systematically implement techniques from research papers (DAPO, MemRL, Titans, RLMs) into the haiku-overseer plugin, then verify integration through conversation logging and gap analysis.
 
 ## Instructions
 
-### Step 1: Comprehensively Read Source Materials
-Read all provided papers, documentation, and existing codebase files (rlm.ts, embeddings.ts, paper-formulas.ts, haiku.ts, db.ts, chunking.ts). Document what is currently implemented versus what the papers propose.
+### Step 1: Analyze Current Implementation State
+Read the core files (src/rlm.ts, src/embeddings.ts, src/paper-formulas.ts, src/haiku.ts, src/db.ts, src/chunking.ts) and produce a detailed gap analysis identifying:
+- What paper techniques are already implemented
+- What specific mechanisms are NOT yet implemented
+- Which formulas or algorithms need integration
 
-### Step 2: Perform Gap Analysis
-For each paper concept, identify:
-- What is already implemented in the codebase
-- What is partially implemented or missing
-- Priority level (critical, high, medium, low)
-- Dependencies or blocking issues
+### Step 2: Implement Paper Techniques
+Based on the gap analysis, implement missing techniques in priority order:
+- EMA utility updates (exponential moving average)
+- MIN_SIMILARITY thresholds and normalization
+- Titans test-time memorization (memory_weight column)
+- DAPO reward shaping (z-score normalization, group-relative rewards)
+- Two-phase value function retrieval paths
+- Dynamic sampling gates and convergence mechanisms
 
-### Step 3: Structure Implementation Plan
-Organize identified gaps into a prioritized roadmap with:
-- Bugfixes and stability issues (Phase 1)
-- Quick wins with high impact (Phase 2)
-- Architectural improvements (Phase 3)
-- Safety and reward shaping enhancements (Phase 4)
-- Persistent memory and advanced features (Phase 5+)
+### Step 3: Add Conversation Logging
+Integrate append-mode file logging to capture private exchanges:
+- Log to `.haiku-overseer/conversation.log`
+- Capture system prompts, user↔haiku exchanges, consolidation calls
+- Record convergence stats and value function outputs
+- Ensure logs are human-readable for verification
 
-### Step 4: Detail Each Implementation Item
-For each item, provide:
-- Clear objective statement
-- Code locations that need modification
-- Specific technical approach referencing the paper
-- Testing strategy to validate the feature
-- Estimated complexity and dependencies
+### Step 4: Verify Integration with Tests
+Create tests that confirm:
+- Conversations are being logged correctly
+- Value function outputs appear in logs
+- Multiple exchange rounds are captured and consolidated
+- Reward propagation flows through the system
 
-### Step 5: Identify Logging & Observability Needs
-Determine what telemetry, logging, or conversation tracking is needed to verify each feature works (e.g., conversation.log for private exchanges, metrics collection for convergence stats).
+### Step 5: Cross-Reference with Flow Patterns
+Identify useful patterns from @agentic-flow and @claude-flow:
+- Multi-agent coordination patterns
+- State management approaches
+- Exchange architecture best practices
 
 ## Output Format
 
-Deliver a structured implementation plan document containing:
-1. Gap analysis summary table
-2. Prioritized 12+ item roadmap with phases
-3. Detailed specification for each item including code diffs
-4. Testing and validation approach per feature
-5. Logging instrumentation requirements
-6. Architecture diagrams showing integration points
+Provide:
+1. Summary of implemented techniques with file locations
+2. List of remaining gaps with implementation priority
+3. Sample conversation.log entries showing successful logging
+4. Test results confirming private exchange capture
+5. Recommendations for @agentic-flow / @claude-flow pattern integration

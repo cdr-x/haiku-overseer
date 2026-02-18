@@ -193,6 +193,7 @@ export function openDb(dbPath: string): Database.Database {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_turns_session_time ON turns(session_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_turns_time ON turns(created_at);
+    CREATE INDEX IF NOT EXISTS idx_events_role_created ON events(role, created_at);
   `);
 
   return db;
@@ -845,4 +846,50 @@ export function updateSkillConfidence(
   db.prepare(
     `UPDATE rlm_skills SET confidence = ?, updated_at = datetime('now') WHERE skill_name = ?`
   ).run(confidence, skillName);
+}
+
+// --- Health Check helpers ---
+
+export interface ChunkStats {
+  total_chunks: number;
+  stale_chunks: number;
+  avg_utility: number;
+  total_skills: number;
+}
+
+export function getChunkStats(db: Database.Database): ChunkStats {
+  const chunkRow = db.prepare(
+    `SELECT COUNT(*) as total, COALESCE(AVG(utility), 0) as avg_util FROM rlm_chunks`
+  ).get() as { total: number; avg_util: number };
+
+  const staleRow = db.prepare(
+    `SELECT COUNT(*) as cnt FROM rlm_chunks WHERE retrieval_count = 0 AND utility < 0.3 AND created_at < datetime('now', '-30 days')`
+  ).get() as { cnt: number };
+
+  let totalSkills = 0;
+  try {
+    totalSkills = (db.prepare(`SELECT COUNT(*) as cnt FROM rlm_skills`).get() as { cnt: number }).cnt;
+  } catch {}
+
+  return {
+    total_chunks: chunkRow.total,
+    stale_chunks: staleRow.cnt,
+    avg_utility: Math.round(chunkRow.avg_util * 100) / 100,
+    total_skills: totalSkills,
+  };
+}
+
+export function checkDbIntegrity(db: Database.Database): "healthy" | "degraded" | "unhealthy" {
+  try {
+    const result = db.prepare("PRAGMA integrity_check").get() as { integrity_check: string };
+    if (result.integrity_check !== "ok") return "unhealthy";
+  } catch {
+    return "unhealthy";
+  }
+
+  const chunkCount = (db.prepare(`SELECT COUNT(*) as cnt FROM rlm_chunks`).get() as { cnt: number }).cnt;
+  const eventCount = (db.prepare(`SELECT COUNT(*) as cnt FROM events`).get() as { cnt: number }).cnt;
+  if (chunkCount > 500 || eventCount > 10000) return "degraded";
+
+  return "healthy";
 }
