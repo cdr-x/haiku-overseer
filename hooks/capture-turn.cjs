@@ -8,6 +8,28 @@ const { spawn } = require("child_process");
 const Database = require("better-sqlite3");
 const { openDb: openCvDb, upsertContextVar, getContextVar, deleteContextVar } = require("./lib/context-vars.cjs");
 
+function hookLog(cwd, section, err, context) {
+  const msg = `[CaptureTurn:${section}] ${err.message || err}`;
+  process.stderr.write(msg + (context ? ` | ${context}` : "") + "\n");
+  try {
+    const logDir = path.join(cwd || ".", ".haiku-overseer");
+    const logPath = path.join(logDir, "hook-errors.log");
+    try {
+      const stat = fs.statSync(logPath);
+      if (stat.size > 100 * 1024) {
+        const content = fs.readFileSync(logPath, "utf-8");
+        fs.writeFileSync(logPath, content.slice(-50 * 1024));
+      }
+    } catch {}
+    const entry = JSON.stringify({
+      hook: "CaptureTurn", section, error: err.message || String(err),
+      stack: err.stack || null, context: context || null,
+      timestamp: new Date().toISOString(),
+    }) + "\n";
+    fs.appendFileSync(logPath, entry);
+  } catch {}
+}
+
 let input = "";
 process.stdin.on("data", (d) => (input += d));
 process.stdin.on("end", () => {
@@ -246,7 +268,8 @@ Respond with ONLY valid JSON: {"CURRENT_TASK": "...", "DECISIONS": [...]}`;
       }
     } catch {}
   } catch (err) {
-    // Silent failure — don't block Claude Code
+    const cwd = (() => { try { return JSON.parse(input).cwd; } catch { return null; } })();
+    hookLog(cwd, "top-level", err, `input_len=${input.length}`);
     process.exit(0);
   }
 });

@@ -177,11 +177,9 @@ export class HnswIndex {
     return 1 - Math.max(0, Math.min(1, dot));
   }
 
-  // --- Random level assignment (geometric distribution) ---
+  // --- Random level assignment (geometric distribution per HNSW paper) ---
   private randomLevel(): number {
-    let level = 0;
-    while (Math.random() < 0.5 && level < 16) level++;
-    return level;
+    return Math.min(16, Math.floor(-Math.log(Math.random()) * this.levelMult));
   }
 
   // --- Insert a vector ---

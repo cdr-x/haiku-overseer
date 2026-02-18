@@ -130,6 +130,21 @@ process.stdin.on("end", async () => {
 
           rlmContext = `<rlm-context>${varSection}${commandsSection}${instructionsSection}\n</rlm-context>`;
 
+          // Gap 10: Recursive summarization — if rlm-context exceeds token budget, compress (RLM paper)
+          const RLM_TOKEN_BUDGET = 1500; // ~1500 tokens ≈ 6000 chars
+          if (rlmContext.length > RLM_TOKEN_BUDGET * 4) {
+            const topChunks = rlmResult.chunks.slice(0, 3);
+            const restCount = rlmResult.chunks.length - 3;
+
+            const compactVars = topChunks.map(c =>
+              `    <var id="${c.id}" type="${c.chunkType || 'unknown'}" similarity="${c.similarity}" utility="${c.utility}">${(c.intent || c.chunkText.slice(0, 120)).replace(/[<>&]/g, ch => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[ch]))}</var>`
+            ).join("\n");
+
+            let compactSection = `\n  <variables count="${topChunks.length}" total_chunks="${rlmResult.totalChunks}" summarized="${restCount} lower-ranked chunks omitted for brevity">\n${compactVars}\n  </variables>`;
+
+            rlmContext = `<rlm-context>${compactSection}${commandsSection}${instructionsSection}\n</rlm-context>`;
+          }
+
           rlmPreview = `RLM: ${rlmResult.chunks ? rlmResult.chunks.length : 0}/${rlmResult.totalChunks} chunks`;
           if (hasCommands) {
             rlmPreview += `, cmds: ${rlmResult.suggestedCommands.map(c => c.name.startsWith("/") ? c.name : `/${c.name}`).join(" ")}`;

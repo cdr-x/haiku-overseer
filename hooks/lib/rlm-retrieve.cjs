@@ -128,9 +128,12 @@ async function retrieve(cwd, userPrompt) {
       const colInfo = db.prepare("PRAGMA table_info(rlm_chunks)").all();
       hasMemoryWeight = colInfo.some(c => c.name === "memory_weight");
     } catch {}
+    // P1: Limit scan to top chunks by utility when DB is large (avoid O(N) with N>200)
+    const MAX_SCAN = 200;
+    const utilityClause = totalChunks > MAX_SCAN ? ` ORDER BY utility DESC LIMIT ${MAX_SCAN}` : "";
     const selectSql = hasMemoryWeight
-      ? "SELECT id, embedding, utility, COALESCE(memory_weight, 1.0) as memory_weight, chunk_text, chunk_type, intent FROM rlm_chunks WHERE embedding IS NOT NULL"
-      : "SELECT id, embedding, utility, 1.0 as memory_weight, chunk_text, chunk_type, intent FROM rlm_chunks WHERE embedding IS NOT NULL";
+      ? `SELECT id, embedding, utility, COALESCE(memory_weight, 1.0) as memory_weight, chunk_text, chunk_type, intent FROM rlm_chunks WHERE embedding IS NOT NULL${utilityClause}`
+      : `SELECT id, embedding, utility, 1.0 as memory_weight, chunk_text, chunk_type, intent FROM rlm_chunks WHERE embedding IS NOT NULL${utilityClause}`;
     const rows = db.prepare(selectSql).all();
 
     if (rows.length === 0) {
@@ -178,12 +181,23 @@ async function retrieve(cwd, userPrompt) {
       .sort((a, b) => b.similarity - a.similarity)
       .slice(0, 20);
 
-    // Phase 2: Re-rank by combined score (α·sim + (1-α)·utility) × memory_weight, take top-K2
-    // memory_weight is the Titans test-time memorization signal
-    const scored = phase1.map(s => ({
-      ...s,
-      combinedScore: Math.round((ALPHA * s.similarity + (1 - ALPHA) * s.utility) * s.memoryWeight * 100) / 100,
-    }));
+    // Gap 1: Z-score normalize similarity and utility within candidate pool (MemRL §3.2)
+    const simVals = phase1.map(s => s.similarity);
+    const utilVals = phase1.map(s => s.utility);
+    const simMean = simVals.reduce((a, b) => a + b, 0) / simVals.length;
+    const utilMean = utilVals.reduce((a, b) => a + b, 0) / utilVals.length;
+    const simStd = Math.sqrt(simVals.reduce((a, v) => a + (v - simMean) ** 2, 0) / simVals.length) || 1;
+    const utilStd = Math.sqrt(utilVals.reduce((a, v) => a + (v - utilMean) ** 2, 0) / utilVals.length) || 1;
+
+    // Phase 2: Re-rank by z-scored combined score × memory_weight, take top-K2
+    const scored = phase1.map(s => {
+      const zSim = (s.similarity - simMean) / simStd;
+      const zUtil = (s.utility - utilMean) / utilStd;
+      return {
+        ...s,
+        combinedScore: Math.round((ALPHA * zSim + (1 - ALPHA) * zUtil) * s.memoryWeight * 100) / 100,
+      };
+    });
 
     // Phase 2: Sort by combined score, take top 10
     scored.sort((a, b) => b.combinedScore - a.combinedScore);
