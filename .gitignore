@@ -2,5 +2,7 @@ node_modules/
 dist/
 .haiku-overseer/
 .claude/settings.local.json
+.claude/commands/
+.claude/skills/
 docs/
 .mcp.json
