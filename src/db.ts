@@ -102,9 +102,60 @@ export function openDb(dbPath: string): Database.Database {
       summary TEXT NOT NULL,
       created_at TEXT DEFAULT (datetime('now'))
     );
+
+    -- RLM: Intent-Experience-Utility triplet storage (MemRL-inspired)
+    CREATE TABLE IF NOT EXISTS rlm_chunks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      turn_number INTEGER,
+      intent TEXT,
+      chunk_text TEXT NOT NULL,
+      chunk_hash TEXT UNIQUE,
+      chunk_type TEXT,
+      utility REAL DEFAULT 0.5,
+      retrieval_count INTEGER DEFAULT 0,
+      success_count INTEGER DEFAULT 0,
+      embedding BLOB,
+      token_count INTEGER,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_rlm_chunks_session ON rlm_chunks(session_id);
+    CREATE INDEX IF NOT EXISTS idx_rlm_chunks_type ON rlm_chunks(chunk_type);
+
+    -- RLM: Bellman conversation log
+    CREATE TABLE IF NOT EXISTS rlm_bellman_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      turn_number INTEGER,
+      exchange_number INTEGER,
+      prompt_summary TEXT,
+      response_json TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- RLM: Auto-generated skills
+    CREATE TABLE IF NOT EXISTS rlm_skills (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      skill_name TEXT UNIQUE NOT NULL,
+      description TEXT,
+      trigger_patterns TEXT,
+      instruction_template TEXT,
+      source_chunks TEXT,
+      confidence REAL DEFAULT 0.5,
+      usage_count INTEGER DEFAULT 0,
+      last_used_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
   `);
 
   // Migrations for existing DBs
+  const chunkCols = db.prepare("PRAGMA table_info(rlm_chunks)").all() as { name: string }[];
+  const chunkColNames = chunkCols.map(c => c.name);
+  if (!chunkColNames.includes("memory_weight")) {
+    db.exec("ALTER TABLE rlm_chunks ADD COLUMN memory_weight REAL DEFAULT 1.0");
+  }
+
   const cols = db.prepare("PRAGMA table_info(token_usage)").all() as { name: string }[];
   const colNames = cols.map(c => c.name);
   if (!colNames.includes("cache_creation_tokens")) {
@@ -573,4 +624,225 @@ export function purgeTurns(
   // Rebuild FTS index after purge
   db.exec(`INSERT INTO turns_fts(turns_fts) VALUES('rebuild')`);
   return result.changes;
+}
+
+// --- RLM Chunks ---
+
+export interface RlmChunkRow {
+  id: number;
+  session_id: string;
+  turn_number: number | null;
+  intent: string | null;
+  chunk_text: string;
+  chunk_hash: string;
+  chunk_type: string | null;
+  utility: number;
+  retrieval_count: number;
+  success_count: number;
+  embedding: Buffer | null;
+  token_count: number | null;
+  memory_weight: number;
+  created_at: string;
+}
+
+export function insertChunk(
+  db: Database.Database,
+  sessionId: string,
+  turnNumber: number | null,
+  intent: string | null,
+  chunkText: string,
+  chunkHash: string,
+  chunkType: string | null,
+  tokenCount: number | null
+): number {
+  const info = db.prepare(
+    `INSERT OR IGNORE INTO rlm_chunks (session_id, turn_number, intent, chunk_text, chunk_hash, chunk_type, token_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(sessionId, turnNumber, intent, chunkText, chunkHash, chunkType, tokenCount);
+  return Number(info.lastInsertRowid);
+}
+
+export function getChunkByHash(
+  db: Database.Database,
+  chunkHash: string
+): RlmChunkRow | undefined {
+  return db.prepare(`SELECT * FROM rlm_chunks WHERE chunk_hash = ?`).get(chunkHash) as RlmChunkRow | undefined;
+}
+
+export function updateChunkEmbedding(
+  db: Database.Database,
+  chunkId: number,
+  embedding: Buffer
+): void {
+  db.prepare(
+    `UPDATE rlm_chunks SET embedding = ? WHERE id = ?`
+  ).run(embedding, chunkId);
+}
+
+export function getAllEmbeddings(
+  db: Database.Database
+): Array<{ id: number; embedding: Buffer; utility: number; memory_weight: number; chunk_text: string; chunk_type: string | null; intent: string | null; created_at: string }> {
+  return db.prepare(
+    `SELECT id, embedding, utility, COALESCE(memory_weight, 1.0) as memory_weight, chunk_text, chunk_type, intent, created_at FROM rlm_chunks WHERE embedding IS NOT NULL`
+  ).all() as Array<{ id: number; embedding: Buffer; utility: number; memory_weight: number; chunk_text: string; chunk_type: string | null; intent: string | null; created_at: string }>;
+}
+
+export function getTopRetrievedIntents(
+  db: Database.Database,
+  limit = 5
+): Array<{ intent: string; retrieval_count: number }> {
+  return db.prepare(
+    `SELECT intent, retrieval_count FROM rlm_chunks
+     WHERE intent IS NOT NULL AND retrieval_count > 0
+     ORDER BY retrieval_count DESC LIMIT ?`
+  ).all(limit) as Array<{ intent: string; retrieval_count: number }>;
+}
+
+export function getChunksByIds(
+  db: Database.Database,
+  ids: number[]
+): RlmChunkRow[] {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  return db.prepare(
+    `SELECT * FROM rlm_chunks WHERE id IN (${placeholders})`
+  ).all(...ids) as RlmChunkRow[];
+}
+
+export function updateChunkUtility(
+  db: Database.Database,
+  chunkId: number,
+  utility: number
+): void {
+  db.prepare(`UPDATE rlm_chunks SET utility = ? WHERE id = ?`).run(utility, chunkId);
+}
+
+export function incrementChunkRetrieval(
+  db: Database.Database,
+  chunkId: number
+): void {
+  db.prepare(`UPDATE rlm_chunks SET retrieval_count = retrieval_count + 1 WHERE id = ?`).run(chunkId);
+}
+
+export function incrementChunkSuccess(
+  db: Database.Database,
+  chunkId: number
+): void {
+  db.prepare(`UPDATE rlm_chunks SET success_count = success_count + 1 WHERE id = ?`).run(chunkId);
+}
+
+export function updateChunkMemoryWeight(
+  db: Database.Database,
+  chunkId: number,
+  weight: number
+): void {
+  db.prepare(`UPDATE rlm_chunks SET memory_weight = ? WHERE id = ?`).run(weight, chunkId);
+}
+
+export function getRecentChunks(
+  db: Database.Database,
+  sessionId: string,
+  limit = 50
+): RlmChunkRow[] {
+  return db.prepare(
+    `SELECT * FROM rlm_chunks WHERE session_id = ? ORDER BY id DESC LIMIT ?`
+  ).all(sessionId, limit) as RlmChunkRow[];
+}
+
+export function getTotalChunkCount(db: Database.Database): number {
+  return (db.prepare(`SELECT COUNT(*) as cnt FROM rlm_chunks`).get() as { cnt: number }).cnt;
+}
+
+// --- RLM Bellman Log ---
+
+export function insertBellmanLog(
+  db: Database.Database,
+  sessionId: string,
+  turnNumber: number | null,
+  exchangeNumber: number,
+  promptSummary: string,
+  responseJson: string
+): void {
+  db.prepare(
+    `INSERT INTO rlm_bellman_log (session_id, turn_number, exchange_number, prompt_summary, response_json)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(sessionId, turnNumber, exchangeNumber, promptSummary, responseJson);
+}
+
+export function getRecentBellmanRewards(
+  db: Database.Database,
+  limit = 20
+): number[] {
+  const rows = db.prepare(
+    `SELECT response_json FROM rlm_bellman_log WHERE exchange_number = 1 ORDER BY id DESC LIMIT ?`
+  ).all(limit) as Array<{ response_json: string }>;
+  const rewards: number[] = [];
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.response_json);
+      if (typeof parsed.reward === "number") rewards.push(parsed.reward);
+    } catch {}
+  }
+  return rewards;
+}
+
+// --- RLM Skills ---
+
+export interface RlmSkillRow {
+  id: number;
+  skill_name: string;
+  description: string | null;
+  trigger_patterns: string | null;
+  instruction_template: string | null;
+  source_chunks: string | null;
+  confidence: number;
+  usage_count: number;
+  last_used_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export function insertOrUpdateSkill(
+  db: Database.Database,
+  skillName: string,
+  description: string | null,
+  triggerPatterns: string | null,
+  instructionTemplate: string | null,
+  sourceChunks: string | null,
+  confidence: number
+): void {
+  db.prepare(
+    `INSERT INTO rlm_skills (skill_name, description, trigger_patterns, instruction_template, source_chunks, confidence)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(skill_name) DO UPDATE SET
+       description = excluded.description,
+       trigger_patterns = excluded.trigger_patterns,
+       instruction_template = excluded.instruction_template,
+       source_chunks = excluded.source_chunks,
+       confidence = excluded.confidence,
+       updated_at = datetime('now')`
+  ).run(skillName, description, triggerPatterns, instructionTemplate, sourceChunks, confidence);
+}
+
+export function getAllSkills(db: Database.Database): RlmSkillRow[] {
+  return db.prepare(`SELECT * FROM rlm_skills ORDER BY confidence DESC`).all() as RlmSkillRow[];
+}
+
+export function updateSkillUsage(
+  db: Database.Database,
+  skillName: string
+): void {
+  db.prepare(
+    `UPDATE rlm_skills SET usage_count = usage_count + 1, last_used_at = datetime('now') WHERE skill_name = ?`
+  ).run(skillName);
+}
+
+export function updateSkillConfidence(
+  db: Database.Database,
+  skillName: string,
+  confidence: number
+): void {
+  db.prepare(
+    `UPDATE rlm_skills SET confidence = ?, updated_at = datetime('now') WHERE skill_name = ?`
+  ).run(confidence, skillName);
 }

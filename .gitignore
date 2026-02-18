@@ -3,3 +3,4 @@ dist/
 .haiku-overseer/
 .claude/settings.local.json
 docs/
+.mcp.json

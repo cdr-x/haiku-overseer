@@ -12,10 +12,51 @@ process.stdin.on("end", () => {
     const toolInput = data.tool_input || {};
     const toolResponse = data.tool_response || {};
 
-    // Only process Write, Edit, Bash
-    if (!["Write", "Edit", "Bash"].includes(toolName)) process.exit(0);
-
     const db = openDb(data.cwd);
+
+    // --- SUGGESTED_COMMANDS nudge + Skill clearing ---
+    try {
+      const cmdVar = getContextVar(db, sessionId, "SUGGESTED_COMMANDS");
+      if (cmdVar) {
+        const commands = JSON.parse(cmdVar.var_value);
+
+        if (toolName === "Skill") {
+          // Check if the invoked skill matches a suggested command
+          const skillName = toolInput.skill || toolInput.name || "";
+          const match = commands.find(c => c.name === skillName || skillName.endsWith(c.name));
+          if (match) {
+            deleteContextVar(db, sessionId, "SUGGESTED_COMMANDS");
+            deleteContextVar(db, sessionId, "_NUDGE_COUNT");
+          }
+        } else if (commands.length > 0) {
+          // Nudge every 3rd tool call
+          let nudgeCount = 0;
+          const nudgeVar = getContextVar(db, sessionId, "_NUDGE_COUNT");
+          if (nudgeVar) {
+            try { nudgeCount = JSON.parse(nudgeVar.var_value); } catch {}
+          }
+          nudgeCount++;
+          upsertContextVar(db, sessionId, "_NUDGE_COUNT", JSON.stringify(nudgeCount), null);
+
+          if (nudgeCount % 3 === 0) {
+            const highConf = commands.filter(c => c.confidence >= 0.5);
+            if (highConf.length > 0) {
+              const cmdNames = highConf.map(c => `/${c.name}`).join(", ");
+              console.log(JSON.stringify({
+                hookSpecificOutput: {
+                  additionalContext: `Reminder: suggested command(s) ${cmdNames} available for this task. Invoke with the Skill tool when ready.`,
+                },
+              }));
+            }
+          }
+        }
+      }
+    } catch {
+      // Don't let nudge logic break the hook
+    }
+
+    // Only process Write, Edit, Bash for file/error tracking
+    if (!["Write", "Edit", "Bash"].includes(toolName)) { db.close(); process.exit(0); }
 
     if (toolName === "Write" || toolName === "Edit") {
       // Track file modifications

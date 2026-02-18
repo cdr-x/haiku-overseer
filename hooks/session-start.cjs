@@ -1,5 +1,5 @@
 // hooks/session-start.cjs
-// SessionStart hook: injects context variable index + recent session summaries
+// SessionStart hook: injects context variable index + recent session summaries + pre-warms RLM model
 const fs = require("fs");
 const path = require("path");
 const Database = require("better-sqlite3");
@@ -73,6 +73,7 @@ process.stdin.on("end", () => {
       },
     };
     console.log(JSON.stringify(result));
+
   } catch {
     process.exit(0);
   }

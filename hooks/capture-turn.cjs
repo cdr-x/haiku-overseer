@@ -1,10 +1,12 @@
 // hooks/capture-turn.cjs
 // Claude Code Stop hook: captures full user prompt + assistant response from transcript
 // Also tracks file modifications as context variables
+// Spawns detached rlm-learn-worker.mjs for deterministic utility updates
 const fs = require("fs");
 const path = require("path");
+const { spawn } = require("child_process");
 const Database = require("better-sqlite3");
-const { openDb: openCvDb, upsertContextVar, getContextVar } = require("./lib/context-vars.cjs");
+const { openDb: openCvDb, upsertContextVar, getContextVar, deleteContextVar } = require("./lib/context-vars.cjs");
 
 let input = "";
 process.stdin.on("data", (d) => (input += d));
@@ -15,6 +17,69 @@ process.stdin.on("end", () => {
     const transcriptPath = data.transcript_path;
     const sessionId = data.session_id || "default";
     if (!transcriptPath || !fs.existsSync(transcriptPath)) process.exit(0);
+
+    // --- SUGGESTED_COMMANDS blocking gate ---
+    // Block stop if a high-confidence command wasn't invoked, unless already blocked once
+    try {
+      const blockDb = openCvDb(data.cwd);
+      const cmdVar = getContextVar(blockDb, sessionId, "SUGGESTED_COMMANDS");
+      // Skip stale suggestions (older than 30 minutes)
+      const isStale = cmdVar && cmdVar.updated_at &&
+        (Date.now() - new Date(cmdVar.updated_at + "Z").getTime()) > 30 * 60 * 1000;
+      if (isStale) {
+        deleteContextVar(blockDb, sessionId, "SUGGESTED_COMMANDS");
+        blockDb.close();
+      } else if (cmdVar && !data.stop_hook_active) {
+        const commands = JSON.parse(cmdVar.var_value);
+        const highConf = commands.filter(c => c.confidence >= 0.6);
+
+        if (highConf.length > 0) {
+          // Check if already blocked once this cycle
+          const meta = cmdVar.var_meta ? JSON.parse(cmdVar.var_meta) : {};
+          if (meta._blocked_once) {
+            // Already blocked once — clear and let stop proceed
+            deleteContextVar(blockDb, sessionId, "SUGGESTED_COMMANDS");
+            blockDb.close();
+          } else {
+            // Scan transcript for evidence the command was invoked
+            const transcript = fs.readFileSync(transcriptPath, "utf-8");
+            const uninvoked = highConf.filter(cmd => {
+              const namePattern = new RegExp(`Skill.*${cmd.name}|/${cmd.name}`, "i");
+              return !namePattern.test(transcript);
+            });
+
+            if (uninvoked.length > 0) {
+              // Mark as blocked once so next stop proceeds
+              meta._blocked_once = true;
+              upsertContextVar(
+                blockDb, sessionId, "SUGGESTED_COMMANDS",
+                cmdVar.var_value,
+                JSON.stringify(meta)
+              );
+              blockDb.close();
+
+              const cmdNames = uninvoked.map(c => `/${c.name}`).join(", ");
+              console.log(JSON.stringify({
+                decision: "block",
+                reason: `You have suggested command(s) ${cmdNames} that weren't run. Please invoke with the Skill tool before finishing, or explicitly explain why they're not needed.`,
+              }));
+              return;
+            }
+            blockDb.close();
+          }
+        } else {
+          blockDb.close();
+        }
+      } else if (cmdVar && data.stop_hook_active) {
+        // Re-entry after a block — clear commands and let stop proceed
+        deleteContextVar(blockDb, sessionId, "SUGGESTED_COMMANDS");
+        blockDb.close();
+      } else {
+        blockDb.close();
+      }
+    } catch {
+      // Don't let blocking logic prevent turn capture
+    }
 
     // Read JSONL transcript, parse each line
     const lines = fs
@@ -73,6 +138,42 @@ process.stdin.on("end", () => {
       "INSERT INTO turns (session_id, user_prompt, assistant_response) VALUES (?, ?, ?)"
     ).run(sessionId, lastUser, lastAssistant);
     db.close();
+
+    // --- Spawn detached RLM learning worker ---
+    // This makes learnFromTurn deterministic (every turn) instead of depending
+    // on Claude calling observe_turn MCP tool. Worker runs in background, updates
+    // utilities in DB before next UserPromptSubmit fires.
+    try {
+      const workerPath = path.join(__dirname, "lib", "rlm-learn-worker.mjs");
+      if (fs.existsSync(workerPath)) {
+        // Extract error signals from assistant response for process reward
+        let errorSignal = null;
+        const errorPatterns = /(?:error|Error|ERROR|exception|failed|FAILED|TypeError|ReferenceError|SyntaxError)/g;
+        const errorMatches = lastAssistant.match(errorPatterns);
+        if (errorMatches && errorMatches.length > 0) {
+          errorSignal = `${errorMatches.length} error mentions detected`;
+        }
+
+        const workerData = JSON.stringify({
+          cwd: data.cwd || process.cwd(),
+          sessionId,
+          userPrompt: lastUser,
+          assistantResponse: lastAssistant,
+          errors: errorSignal,
+        });
+
+        const child = spawn("node", [workerPath], {
+          stdio: ["pipe", "ignore", "ignore"],
+          detached: true,
+          env: { ...process.env },
+        });
+        child.stdin.write(workerData);
+        child.stdin.end();
+        child.unref(); // don't wait for worker — it runs in background
+      }
+    } catch {
+      // Don't let worker spawn failure block the hook
+    }
 
     // Deterministic file tracking: parse assistant response for Write/Edit file paths
     try {

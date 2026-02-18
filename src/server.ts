@@ -28,6 +28,7 @@ import {
 } from "./db.js";
 import { callHaiku } from "./haiku.js";
 import { log1, log2 } from "./logger.js";
+import { learnFromTurn } from "./rlm.js";
 
 // --- Thinking state: stream Haiku progress to a JSON file for statusline ---
 const THINKING_PATH = path.join(
@@ -301,6 +302,9 @@ async function debouncedObserveTurn(
 
   // Fire-and-forget micro-summary check (don't block the main flow)
   maybeGenerateMicroSummary(sessionId).catch(() => {});
+
+  // Fire-and-forget RLM learning pipeline (chunk → embed → skill)
+  learnFromTurn(db, sessionId, turn.user_prompt, turn.assistant_response, turn.errors).catch(() => {});
 
   // Check if a Haiku call is already in-flight for this session
   const existing = inFlightSessions.get(sessionId);
