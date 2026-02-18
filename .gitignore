@@ -5,4 +5,8 @@ dist/
 .claude/commands/
 .claude/skills/
 docs/
+old/
+agentic-flow/
+claude-flow/
+nul
 .mcp.json
