@@ -144,7 +144,7 @@ export async function callHaikuStructured<T extends Record<string, unknown>>(
 ): Promise<{ result: T; usage: HaikuUsage }> {
   const response = await client.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 1024,
+    max_tokens: 2048,
     system: systemPrompt,
     messages,
     tools: [responseSchema],
@@ -228,11 +228,12 @@ export async function convergentExchange(
   });
 
   finalDelta = (lastResult.delta as number) ?? 1.0;
-  const threshold = (lastResult.threshold as number) ?? 0.05;
+  const threshold = 0.05; // fixed convergence threshold
   convergedAtRound = 1;
 
-  // #10 RLMs: Track previous q_value for external delta verification
-  let prevQValue = (lastResult.q_value as number) ?? undefined;
+  // #10 RLMs: Track previous chunk assessments for external delta verification
+  let prevAssessments: Array<{chunk_id: number; q_value: number}> =
+    ((lastResult.chunk_assessments as any[]) || []).map((a: any) => ({ chunk_id: a.chunk_id, q_value: a.q_value }));
 
   // Subsequent rounds
   for (let round = 2; round <= maxRounds; round++) {
@@ -271,16 +272,22 @@ export async function convergentExchange(
       content: [{ type: "tool_result", tool_use_id: `round_${round}`, content: "Received. Continue refining." }],
     });
 
-    // #10 RLMs: External delta verification — cross-check self-reported delta
+    // #10 RLMs: External delta verification — cross-check self-reported delta against per-chunk Q changes
     const selfReportedDelta = (lastResult.delta as number) ?? 0;
-    const currentQValue = (lastResult.q_value as number) ?? undefined;
+    const currentAssessments: Array<{chunk_id: number; q_value: number}> =
+      ((lastResult.chunk_assessments as any[]) || []).map((a: any) => ({ chunk_id: a.chunk_id, q_value: a.q_value }));
     let externalDelta = selfReportedDelta;
-    if (prevQValue !== undefined && currentQValue !== undefined) {
-      externalDelta = Math.abs(currentQValue - prevQValue);
+    if (prevAssessments.length > 0 && currentAssessments.length > 0) {
+      const prevMap = new Map(prevAssessments.map(a => [a.chunk_id, a.q_value]));
+      const maxChunkDelta = currentAssessments.reduce((max, a) => {
+        const prev = prevMap.get(a.chunk_id);
+        return prev !== undefined ? Math.max(max, Math.abs(a.q_value - prev)) : max;
+      }, 0);
+      externalDelta = maxChunkDelta;
     }
     // Use the max of self-reported and external — only trust convergence when both agree
     finalDelta = Math.max(selfReportedDelta, externalDelta);
-    prevQValue = currentQValue;
+    prevAssessments = currentAssessments;
     convergedAtRound = round;
   }
 

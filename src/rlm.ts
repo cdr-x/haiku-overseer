@@ -153,14 +153,16 @@ export async function learnFromTurn(
     }
 
     // 4. Deterministic EMA utility updates (if we have recently-retrieved chunks)
-    await updateUtilities(db, sessionId, turnNumber, !!errors, newChunks.length, assistantResponse.length, errors).catch((e) =>
+    await updateUtilities(db, sessionId, turnNumber, !!errors, newChunks.length, assistantResponse.length, errors, userPrompt).catch((e) =>
       rlmLog("bellman", `Utility update failed: ${String(e)}`)
     );
 
-    // 5. Skill creation (runs every turn)
-    await createOrUpdateSkill(db, sessionId).catch((e) =>
-      rlmLog("skill", `Skill creation failed: ${String(e)}`)
-    );
+    // 5. Skill creation (backpressure: every 10 turns to avoid per-turn Haiku API cost)
+    if (turnNumber % 10 === 0 || turnNumber === 1) {
+      await createOrUpdateSkill(db, sessionId).catch((e) =>
+        rlmLog("skill", `Skill creation failed: ${String(e)}`)
+      );
+    }
   } catch (err) {
     rlmLog("chunk", `learnFromTurn failed: ${String(err)}`);
   }
@@ -194,7 +196,8 @@ export interface RetrievalResult {
 
 export async function classifyAndRetrieve(
   db: Database.Database,
-  userPrompt: string
+  userPrompt: string,
+  sessionId: string = "default"
 ): Promise<RetrievalResult> {
   const totalChunks = getTotalChunkCount(db);
   if (totalChunks === 0) {
@@ -236,6 +239,14 @@ export async function classifyAndRetrieve(
   const allEmbs = scored.map((s) => bufferToFloat32(s.embedding));
   const now = Date.now();
 
+  // Gap 1: Z-score normalize similarity and utility within candidate pool (MemRL §3.2)
+  const simValues = scored.map(s => s.similarity);
+  const utilValues = scored.map(s => s.utility);
+  const simMean = simValues.reduce((a, b) => a + b, 0) / simValues.length;
+  const utilMean = utilValues.reduce((a, b) => a + b, 0) / utilValues.length;
+  const simStd = Math.sqrt(simValues.reduce((a, v) => a + (v - simMean) ** 2, 0) / simValues.length) || 1;
+  const utilStd = Math.sqrt(utilValues.reduce((a, v) => a + (v - utilMean) ** 2, 0) / utilValues.length) || 1;
+
   const reranked = scored
     .map((s) => {
       const emb = bufferToFloat32(s.embedding);
@@ -248,7 +259,10 @@ export async function classifyAndRetrieve(
       const ageDays = Math.max(0, ageMs / (1000 * 60 * 60 * 24));
       const timeDecay = Math.exp(-TIME_DECAY_LAMBDA * ageDays);
 
-      const baseScore = RETRIEVAL_ALPHA * s.similarity + (1 - RETRIEVAL_ALPHA) * (s.utility * timeDecay);
+      // Gap 1: Use z-scored values so neither term dominates
+      const zSim = (s.similarity - simMean) / simStd;
+      const zUtil = (s.utility - utilMean) / utilStd;
+      const baseScore = RETRIEVAL_ALPHA * zSim + (1 - RETRIEVAL_ALPHA) * (zUtil * timeDecay);
       return {
         ...s,
         combinedScore: (baseScore + noveltyBonus) * s.memory_weight,
@@ -256,6 +270,19 @@ export async function classifyAndRetrieve(
     })
     .sort((a, b) => b.combinedScore - a.combinedScore)
     .slice(0, 10); // Top-K2=10
+
+  // Gap 3: Context detachment protection (MemRL §4.1)
+  // Detect when top results have high utility but low similarity → semantically irrelevant
+  const DETACHMENT_SIM_FLOOR = 0.35;
+  const DETACHMENT_RATIO = 0.5;
+  const detachedCount = reranked.filter(r => r.similarity < DETACHMENT_SIM_FLOOR && r.utility > 0.6).length;
+  if (detachedCount > 0) {
+    rlmLog("retrieve", `Context detachment: ${detachedCount}/${reranked.length} chunks have high Q but low similarity`);
+  }
+  if (reranked.length > 0 && detachedCount / reranked.length >= DETACHMENT_RATIO) {
+    rlmLog("retrieve", `Detachment override: re-sorting by similarity (${detachedCount}/${reranked.length} detached)`);
+    reranked.sort((a, b) => b.similarity - a.similarity);
+  }
 
   // Mark as retrieved
   for (const r of reranked) {
@@ -282,7 +309,7 @@ export async function classifyAndRetrieve(
       if (matched && skill.confidence > 0.3) {
         matchedSkill = skill.skill_name;
         // #1: Store matched skill for correct EMA targeting in updateSkillConfidenceEMA
-        lastMatchedSkill.set("global", skill.skill_name);
+        lastMatchedSkill.set(sessionId, skill.skill_name);
         updateSkillUsage(db, skill.skill_name);
         suggestedCommands.push({
           name: `/${skill.skill_name}`,
@@ -380,7 +407,8 @@ async function updateUtilities(
   hadErrors: boolean,
   newChunkCount: number,
   responseLength: number = 0,
-  errorText?: string
+  errorText?: string,
+  userPrompt?: string
 ): Promise<void> {
   const allEmbeddings = getAllEmbeddings(db);
   let recentlyRetrieved = allEmbeddings.filter((r) => {
@@ -504,15 +532,18 @@ async function updateUtilities(
     const updates: Array<{ chunk_id: number; q_old: number; q_new: number; delta: number }> = [];
 
     for (const est of knnEstimates) {
-      // Blend k-NN estimate with EMA update (using decoupled alpha)
-      const emaQ = Math.max(0, Math.min(1, est.q_old + emaAlpha * reward));
-      const q_new = Math.max(0, Math.min(1, 0.6 * est.knn_q + 0.4 * emaQ));
+      // Differential reward: scale by chunk's relevance to current turn centroid
+      const chunkEmb = recentlyRetrieved.find((r) => r.id === est.chunk_id)?.embedding;
+      const relevance = chunkEmb && turnCent.length > 0
+        ? cosineSimilarity(bufferToFloat32(chunkEmb), turnCent)
+        : 0.5;
+      const scaledReward = reward * Math.max(0.2, relevance); // floor at 20% of reward
+      const q_new = Math.max(0, Math.min(1, est.q_old + emaAlpha * (scaledReward - est.q_old)));
       updates.push({ chunk_id: est.chunk_id, q_old: est.q_old, q_new, delta: q_new - est.q_old });
       updateChunkUtility(db, est.chunk_id, q_new);
       incrementChunkSuccess(db, est.chunk_id);
 
       // #4 Titans: Data-dependent forget gate — surprise modulates boost rate
-      const chunkEmb = recentlyRetrieved.find((r) => r.id === est.chunk_id)?.embedding;
       const chunkSurprise = chunkEmb ? surpriseScore(bufferToFloat32(chunkEmb), allEmbs) : 0;
       // High surprise → stronger boost (0.9→1.0 range), low surprise → gentle
       const boostRate = 0.9 + 0.1 * (1 - chunkSurprise); // adaptive: high surprise = 0.9x, low = 1.0x
@@ -563,57 +594,59 @@ async function updateUtilities(
     }
 
     try {
+      const textBudget = Math.floor(2000 / Math.max(1, knnEstimates.length)); // dynamic cap per chunk
+
       const exchangeResult = await convergentExchange({
         formulaPrefix: COMPOSITE_SKILL,
         responseSchema: CONVERGENT_ROUND_SCHEMA,
         initialData: {
-          chunks: knnEstimates.map((e) => ({
-            chunk_id: e.chunk_id,
-            q_old: e.q_old,
-            knn_q_estimate: Math.round(e.knn_q * 1000) / 1000,
-            memory_weight_old: e.memory_weight_old,
-          })),
-          surprise_avg: Math.round(avgSurprise * 1000) / 1000,
-          cluster_density: Math.round(density * 1000) / 1000,
-          trajectory_drift: Math.round(drift * 1000) / 1000,
-          raw_reward: rawReward,
-          normalized_reward: reward,
+          user_query: (userPrompt || "").slice(0, 500),
           had_errors: hadErrors,
-          recent_rewards: recentRewards.slice(0, 10),
+          raw_reward: rawReward,
+          surprise_avg: Math.round(avgSurprise * 1000) / 1000,
+          chunks: knnEstimates.map((e) => {
+            const row = recentlyRetrieved.find((r) => r.id === e.chunk_id);
+            return {
+              chunk_id: e.chunk_id,
+              q_old: e.q_old,
+              memory_weight_old: e.memory_weight_old,
+              chunk_type: row?.chunk_type || "unknown",
+              text: (row?.intent || row?.chunk_text || "").slice(0, textBudget),
+            };
+          }),
         },
         refinementData: (round, prevResult) => ({
-          instruction: "Refine your value assessment. Consider the embedding geometry signals more carefully.",
+          instruction: "Refine your per-chunk assessments. Differentiate more between chunks. Reduce delta toward convergence.",
           round,
-          previous_q_value: prevResult.q_value,
-          previous_memory_weight: prevResult.memory_weight,
-          neighbor_q_values: knnEstimates.map((e) => ({
-            chunk_id: e.chunk_id,
-            knn_q: Math.round(e.knn_q * 1000) / 1000,
-          })),
-          cluster_density: Math.round(density * 1000) / 1000,
-          trajectory_drift: Math.round(drift * 1000) / 1000,
+          previous_assessments: prevResult.chunk_assessments,
         }),
         maxRounds: 6,
       });
 
-      // Apply Haiku's converged values
+      // Apply Haiku's per-chunk assessments
       const lastRound = exchangeResult.transcript.rounds[exchangeResult.transcript.rounds.length - 1];
-      const convergedQ = (lastRound.assistantResult.q_value as number) ?? 0.5;
-      const convergedMw = (lastRound.assistantResult.memory_weight as number) ?? 1.0;
+      const assessments: Array<{chunk_id: number; q_value: number; memory_weight: number; relevance: number}>
+        = (lastRound.assistantResult.chunk_assessments as any[]) || [];
+
+      // Build lookup map
+      const assessmentMap = new Map(assessments.map(a => [a.chunk_id, a]));
       const updates: Array<{ chunk_id: number; q_old: number; q_new: number; delta: number }> = [];
 
       for (const est of knnEstimates) {
-        // #2: Blend convergedQ with per-chunk knn_q instead of uniform assignment
-        const q_new = Math.max(0, Math.min(1, 0.5 * convergedQ + 0.5 * est.knn_q));
-        updates.push({ chunk_id: est.chunk_id, q_old: est.q_old, q_new, delta: q_new - est.q_old });
-        updateChunkUtility(db, est.chunk_id, q_new);
-        // #4 Titans: Data-dependent memory weight — surprise modulates the converged weight
-        const chunkEmb = recentlyRetrieved.find((r) => r.id === est.chunk_id)?.embedding;
-        const chunkSurprise = chunkEmb ? surpriseScore(bufferToFloat32(chunkEmb), allEmbs) : 0;
-        const decayRate = 0.9 + 0.1 * (1 - chunkSurprise); // high surprise → stronger update
-        const adaptedMw = convergedMw * decayRate;
-        const clampedMw = Math.max(0.5, Math.min(2.0, adaptedMw));
-        updateChunkMemoryWeight(db, est.chunk_id, Math.round(clampedMw * 1000) / 1000);
+        const assessment = assessmentMap.get(est.chunk_id);
+        if (assessment) {
+          // Use Haiku's per-chunk Q-value directly (blended with q_old for stability)
+          const q_new = Math.max(0, Math.min(1, 0.4 * assessment.q_value + 0.6 * est.q_old));
+          const mw = Math.max(0.5, Math.min(2.0, assessment.memory_weight));
+          updates.push({ chunk_id: est.chunk_id, q_old: est.q_old, q_new, delta: q_new - est.q_old });
+          updateChunkUtility(db, est.chunk_id, q_new);
+          updateChunkMemoryWeight(db, est.chunk_id, Math.round(mw * 1000) / 1000);
+        } else {
+          // Fallback: pure EMA for chunks Haiku didn't assess
+          const q_new = Math.max(0, Math.min(1, est.q_old + 0.15 * (reward - est.q_old)));
+          updates.push({ chunk_id: est.chunk_id, q_old: est.q_old, q_new, delta: q_new - est.q_old });
+          updateChunkUtility(db, est.chunk_id, q_new);
+        }
         if (!hadErrors) incrementChunkSuccess(db, est.chunk_id);
       }
 
@@ -646,7 +679,7 @@ async function updateUtilities(
       // #9: Use decoupled alpha
       const fallbackAlpha = reward >= 0 ? EMA_ALPHA_UP : EMA_ALPHA_DOWN;
       for (const est of knnEstimates) {
-        const q_new = Math.max(0, Math.min(1, est.q_old + fallbackAlpha * reward));
+        const q_new = Math.max(0, Math.min(1, est.q_old + fallbackAlpha * (reward - est.q_old)));
         updateChunkUtility(db, est.chunk_id, q_new);
         // #4 Titans: Data-dependent forget gate in fallback too
         const chunkEmb = recentlyRetrieved.find((r) => r.id === est.chunk_id)?.embedding;
@@ -706,7 +739,7 @@ async function updateSkillConfidenceEMA(
 ): Promise<void> {
   const skills = getAllSkills(db);
   // #1: Use the last matched skill from retrieval, not just any skill with usage_count > 0
-  const matchedName = lastMatchedSkill.get("global");
+  const matchedName = lastMatchedSkill.get(sessionId);
   const recentlyUsedSkill = matchedName
     ? skills.find((s) => s.skill_name === matchedName)
     : skills.find((s) => s.usage_count > 0);

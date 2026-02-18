@@ -43,65 +43,65 @@ Higher surprise → larger memory weight update. Chunks that are novel and succe
 get strongly reinforced; familiar failures get decayed.
 You must output a memory_weight reflecting the chunk's memorization priority.`;
 
-export const COMPOSITE_SKILL = `${MEMRL_BELLMAN}
+export const COMPOSITE_SKILL = `## Chunk Value Evaluation
 
-${DAPO_GROUP_NORM}
+You are evaluating stored memory chunks for a coding assistant. Each chunk is a snippet from a prior conversation (user prompt, assistant response, decision, or error pattern).
 
-${TITANS_SURPRISE}
+### Scoring Guide
 
-## Combined Value Assessment
+**q_value** (0-1): Long-term utility of this chunk
+- 0.8-1.0: Directly answers the query type, contains reusable patterns or key decisions
+- 0.5-0.7: Partially relevant, provides useful background context
+- 0.2-0.4: Tangentially related, unlikely to help with this query type
+- 0.0-0.2: Irrelevant to the current context
 
-Using all three frameworks together, assess the chunk's value holistically:
-1. Q-value via Bellman update with learning rate convergence
-2. Normalized reward via group-relative advantage
-3. Memory weight via surprise-gated memorization
+**memory_weight** (0.5-2.0): How strongly to retain this chunk
+- >1.5: Novel, high-value — actively boost in future retrieval
+- 1.0: Neutral — keep as-is
+- <0.8: Stale or redundant — allow to fade
 
-Your assessment should integrate all three signals into a coherent value judgment.`;
+**relevance** (0-1): How well this chunk matches the current user query
+- 1.0: Directly addresses the user's question
+- 0.5: Related topic but different aspect
+- 0.0: No connection to the current query
+
+### Update Rule
+Q_new = Q_old + α·(r - Q_old) where r is your assessed relevance, α=0.15
+Use this as a guide — your q_value should reflect both the formula update AND your semantic judgment.
+
+### Important
+- Evaluate each chunk INDEPENDENTLY based on its text content
+- A chunk with high q_old but low relevance to this query should get a LOWER q_value
+- A chunk with low q_old but high relevance should get a HIGHER q_value
+- Differentiate — do NOT give all chunks the same score`;
 
 // Structured output schema for convergent exchange rounds
 export const CONVERGENT_ROUND_SCHEMA = {
   name: "value_assessment",
-  description: "Structured value assessment for a convergent exchange round",
+  description: "Per-chunk value assessment for a convergent exchange round",
+  strict: true,
   input_schema: {
     type: "object" as const,
     properties: {
-      q_value: {
-        type: "number",
-        description: "Updated Q-value estimate (0-1 range)",
+      chunk_assessments: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            chunk_id: { type: "integer", description: "ID of the chunk being assessed" },
+            q_value: { type: "number", description: "Updated Q-value (0-1). High = likely useful in future similar queries" },
+            memory_weight: { type: "number", description: "Memorization priority (0.5-2.0). High = should be retained and surfaced" },
+            relevance: { type: "number", description: "How relevant this chunk was to the user's query (0-1)" },
+          },
+          required: ["chunk_id", "q_value", "memory_weight", "relevance"] as const,
+          additionalProperties: false,
+        },
       },
-      normalized_reward: {
-        type: "number",
-        description: "Group-relative normalized reward (-1 to 1)",
-      },
-      memory_weight: {
-        type: "number",
-        description: "Surprise-gated memory weight (0.5-2.0)",
-      },
-      exchanges_needed: {
-        type: "number",
-        description: "How many MORE rounds needed to converge (0 = done)",
-      },
-      threshold: {
-        type: "number",
-        description: "Convergence threshold — stop when delta < this",
-      },
-      delta: {
-        type: "number",
-        description: "Change magnitude from previous round's values",
-      },
-      reasoning: {
-        type: "string",
-        description: "Brief explanation of this round's assessment",
-      },
+      exchanges_needed: { type: "integer", description: "Remaining rounds to converge (0 = done)" },
+      delta: { type: "number", description: "Max change from previous round's values" },
+      reasoning: { type: "string", description: "Brief explanation of assessments" },
     },
-    required: [
-      "q_value",
-      "normalized_reward",
-      "memory_weight",
-      "exchanges_needed",
-      "threshold",
-      "delta",
-      "reasoning",
-    ],
+    required: ["chunk_assessments", "exchanges_needed", "delta", "reasoning"] as const,
+    additionalProperties: false,
   },
 };
