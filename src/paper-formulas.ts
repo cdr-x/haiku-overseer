@@ -69,11 +69,23 @@ You are evaluating stored memory chunks for a coding assistant. Each chunk is a 
 Q_new = Q_old + α·(r - Q_old) where r is your assessed relevance, α=0.15
 Use this as a guide — your q_value should reflect both the formula update AND your semantic judgment.
 
+**contribution** (-1, 0, +1): Did this chunk help or hurt the current turn?
+- +1: Chunk directly contributed to a good outcome (correct answer, useful pattern)
+- 0: Chunk was neutral — neither helped nor hurt
+- -1: Chunk was misleading or led to errors
+
+**process_quality** (0-1): Quality of reasoning in this chunk, independent of outcome
+- 0.8-1.0: Sound reasoning, good methodology, clear logic
+- 0.4-0.7: Acceptable but could be improved
+- 0.0-0.3: Poor reasoning, incorrect assumptions, flawed logic
+
 ### Important
 - Evaluate each chunk INDEPENDENTLY based on its text content
 - A chunk with high q_old but low relevance to this query should get a LOWER q_value
 - A chunk with low q_old but high relevance should get a HIGHER q_value
-- Differentiate — do NOT give all chunks the same score`;
+- Differentiate — do NOT give all chunks the same score
+- Assess contribution direction honestly — not all chunks help
+- Process quality is about HOW the chunk reasons, not just WHAT it concludes`;
 
 // Structured output schema for convergent exchange rounds
 export const CONVERGENT_ROUND_SCHEMA = {
@@ -92,8 +104,10 @@ export const CONVERGENT_ROUND_SCHEMA = {
             q_value: { type: "number", description: "Updated Q-value (0-1). High = likely useful in future similar queries" },
             memory_weight: { type: "number", description: "Memorization priority (0.5-2.0). High = should be retained and surfaced" },
             relevance: { type: "number", description: "How relevant this chunk was to the user's query (0-1)" },
+            contribution: { type: "integer", description: "Chunk contribution direction: +1 = helped, 0 = neutral, -1 = hurt" },
+            process_quality: { type: "number", description: "Quality of the reasoning process this chunk represents (0-1), independent of outcome" },
           },
-          required: ["chunk_id", "q_value", "memory_weight", "relevance"] as const,
+          required: ["chunk_id", "q_value", "memory_weight", "relevance", "contribution", "process_quality"] as const,
           additionalProperties: false,
         },
       },

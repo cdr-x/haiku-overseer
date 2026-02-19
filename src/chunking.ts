@@ -13,8 +13,16 @@ export interface Chunk {
 
 export type ChunkType = "user_prompt" | "assistant" | "error" | "decision" | "pattern" | "code";
 
-const TARGET_TOKENS = 500;
+let TARGET_TOKENS = 500;
 const OVERLAP_TOKENS = 50;
+
+export function setTargetTokens(n: number): void {
+  TARGET_TOKENS = n;
+}
+
+export function getTargetTokens(): number {
+  return TARGET_TOKENS;
+}
 
 function estimateTokens(text: string): number {
   // ~1.3 tokens per word + punctuation

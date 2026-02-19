@@ -6,7 +6,7 @@ import type Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 import Anthropic from "@anthropic-ai/sdk";
-import { chunkTurn } from "./chunking.js";
+import { chunkTurn, setTargetTokens, getTargetTokens } from "./chunking.js";
 import {
   embedBatch,
   embedSingle,
@@ -19,7 +19,7 @@ import {
   trajectoryDrift,
   centroid,
 } from "./embeddings.js";
-import { convergentExchange, setPersistentContext } from "./haiku.js";
+import { convergentExchange, setPersistentContext, callHaikuStructured } from "./haiku.js";
 import { COMPOSITE_SKILL, CONVERGENT_ROUND_SCHEMA } from "./paper-formulas.js";
 import {
   insertChunk,
@@ -40,6 +40,9 @@ import {
   updateSkillConfidence,
   getTopRetrievedIntents,
   getContextVar,
+  updateChunkIntent,
+  getMetaChunks,
+  setChunkMeta,
 } from "./db.js";
 import { rlmLog } from "./rlm-debug.js";
 import { getOrBuildIndex } from "./hnsw.js";
@@ -96,8 +99,32 @@ export async function learnFromTurn(
   sessionTurnCounters.set(sessionId, turnNumber);
 
   try {
+    // F1: Surprise-based selective chunking — adjust granularity based on novelty
+    try {
+      const turnText = userPrompt + " " + assistantResponse;
+      const turnEmb = await embedSingle(turnText.slice(0, 2000));
+      const allEmbs = getAllEmbeddings(db);
+      const recentEmbs = allEmbs.slice(-20).filter(e => e.embedding).map(e => bufferToFloat32(e.embedding));
+      if (recentEmbs.length >= 3) {
+        const recentCent = centroid(recentEmbs);
+        const surprise = 1 - cosineSimilarity(turnEmb, recentCent);
+        if (surprise > 0.5) {
+          setTargetTokens(250); // fine chunking for novel turns
+          rlmLog("chunk", `F1: High surprise (${Math.round(surprise * 100) / 100}) → fine chunking (250 tokens)`);
+        } else if (surprise < 0.15) {
+          setTargetTokens(1000); // coarse chunking for familiar turns
+          rlmLog("chunk", `F1: Low surprise (${Math.round(surprise * 100) / 100}) → coarse chunking (1000 tokens)`);
+        } else {
+          setTargetTokens(500); // default
+        }
+      }
+    } catch (err) {
+      rlmLog("chunk", `F1: Surprise embedding failed, using default chunking: ${String(err)}`);
+    }
+
     // 1. Chunk the turn
     const chunks = chunkTurn(userPrompt, assistantResponse, errors);
+    setTargetTokens(500); // reset after chunking
     rlmLog("chunk", `Turn ${turnNumber}: ${chunks.length} chunks produced`, {
       sessionId,
       types: chunks.map((c) => c.type),
@@ -162,6 +189,11 @@ export async function learnFromTurn(
       await createOrUpdateSkill(db, sessionId).catch((e) =>
         rlmLog("skill", `Skill creation failed: ${String(e)}`)
       );
+    }
+
+    // F4B: Meta-chunk promotion (every 20 turns)
+    if (turnNumber % 20 === 0) {
+      promoteMetaChunks(db, sessionId);
     }
   } catch (err) {
     rlmLog("chunk", `learnFromTurn failed: ${String(err)}`);
@@ -233,6 +265,18 @@ export async function classifyAndRetrieve(
     })
     .filter((s): s is NonNullable<typeof s> => s !== null && s.similarity >= MIN_SIMILARITY)
     .slice(0, 20); // Top-K1=20
+
+  // F4A: Inject persistent meta-chunks into candidate set
+  const metaChunks = getMetaChunks(db);
+  if (metaChunks.length > 0) {
+    const existingIds = new Set(scored.map(s => s.id));
+    for (const mc of metaChunks) {
+      if (existingIds.has(mc.id)) continue; // already in results
+      const row = embeddingMap.get(mc.id);
+      if (!row) continue;
+      scored.push({ ...row, similarity: 0.5 }); // neutral similarity for meta-chunks
+    }
+  }
 
   // Phase 2: Re-rank by combined score with surprise novelty bonus (#5) and time decay (#7)
   // Compute scored embeddings for surprise calculation
@@ -399,6 +443,22 @@ export async function classifyAndRetrieve(
 const SURPRISE_THRESHOLD = 0.3;
 const DENSITY_THRESHOLD = 0.7;
 const REWARD_PROPAGATION_DECAY = 0.3;
+const UTILITY_FLOOR = 0.1; // F7: Minimum Q-value — prevents chunks from becoming permanently dead
+
+// F6: Triage schema for recursive context filtering
+const TRIAGE_SCHEMA = {
+  name: "context_triage",
+  description: "Filter chunks by relevance to the current turn",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      relevant_chunk_ids: { type: "array" as const, items: { type: "integer" as const }, description: "IDs of chunks relevant to evaluating this turn" },
+      reasoning: { type: "string" as const, description: "Brief explanation of why these chunks were selected" },
+    },
+    required: ["relevant_chunk_ids", "reasoning"] as const,
+    additionalProperties: false,
+  },
+};
 
 async function updateUtilities(
   db: Database.Database,
@@ -538,7 +598,7 @@ async function updateUtilities(
         ? cosineSimilarity(bufferToFloat32(chunkEmb), turnCent)
         : 0.5;
       const scaledReward = reward * Math.max(0.2, relevance); // floor at 20% of reward
-      const q_new = Math.max(0, Math.min(1, est.q_old + emaAlpha * (scaledReward - est.q_old)));
+      const q_new = Math.max(UTILITY_FLOOR, Math.min(1, est.q_old + emaAlpha * (scaledReward - est.q_old)));
       updates.push({ chunk_id: est.chunk_id, q_old: est.q_old, q_new, delta: q_new - est.q_old });
       updateChunkUtility(db, est.chunk_id, q_new);
       incrementChunkSuccess(db, est.chunk_id);
@@ -553,6 +613,9 @@ async function updateUtilities(
 
     // Reward propagation to embedding neighbors
     propagateRewards(db, allEmbeddings, knnEstimates, updates);
+
+    // F3: Memory reconsolidation (fast path)
+    reconsolidateMemory(db, knnEstimates.map(e => e.chunk_id), userPrompt || "", false, undefined);
 
     const bellmanRecord = {
       method: "fast_path_knn",
@@ -594,7 +657,30 @@ async function updateUtilities(
     }
 
     try {
-      const textBudget = Math.floor(2000 / Math.max(1, knnEstimates.length)); // dynamic cap per chunk
+      // F6: Recursive context triage — pre-filter chunks via Haiku when there are many
+      let triagedEstimates = knnEstimates;
+      if (knnEstimates.length >= 5) {
+        try {
+          const triageEvents = knnEstimates.map(e => {
+            const row = recentlyRetrieved.find(r => r.id === e.chunk_id);
+            return { chunk_id: e.chunk_id, type: row?.chunk_type || "unknown", text: (row?.intent || row?.chunk_text || "").slice(0, 150) };
+          });
+          const triageResult = await callHaikuStructured<{ relevant_chunk_ids: number[]; reasoning: string }>(
+            "You are a relevance filter. Given a user query and a list of memory chunks, return ONLY the chunk_ids that are relevant to evaluating this turn.",
+            [{ role: "user", content: JSON.stringify({ user_query: (userPrompt || "").slice(0, 300), chunks: triageEvents }) }],
+            TRIAGE_SCHEMA
+          );
+          const relevantIds = new Set(triageResult.result.relevant_chunk_ids);
+          if (relevantIds.size > 0) {
+            triagedEstimates = knnEstimates.filter(e => relevantIds.has(e.chunk_id));
+            rlmLog("bellman", `F6: Triage kept ${triagedEstimates.length}/${knnEstimates.length} chunks: ${triageResult.result.reasoning}`);
+          }
+        } catch (err) {
+          rlmLog("bellman", `F6: Triage failed, using all chunks: ${String(err)}`);
+        }
+      }
+
+      const textBudget = Math.floor(2000 / Math.max(1, triagedEstimates.length)); // dynamic cap per chunk
 
       const exchangeResult = await convergentExchange({
         formulaPrefix: COMPOSITE_SKILL,
@@ -604,7 +690,7 @@ async function updateUtilities(
           had_errors: hadErrors,
           raw_reward: rawReward,
           surprise_avg: Math.round(avgSurprise * 1000) / 1000,
-          chunks: knnEstimates.map((e) => {
+          chunks: triagedEstimates.map((e) => {
             const row = recentlyRetrieved.find((r) => r.id === e.chunk_id);
             return {
               chunk_id: e.chunk_id,
@@ -625,7 +711,7 @@ async function updateUtilities(
 
       // Apply Haiku's per-chunk assessments
       const lastRound = exchangeResult.transcript.rounds[exchangeResult.transcript.rounds.length - 1];
-      const assessments: Array<{chunk_id: number; q_value: number; memory_weight: number; relevance: number}>
+      const assessments: Array<{chunk_id: number; q_value: number; memory_weight: number; relevance: number; contribution?: number; process_quality?: number}>
         = (lastRound.assistantResult.chunk_assessments as any[]) || [];
 
       // Build lookup map
@@ -635,15 +721,23 @@ async function updateUtilities(
       for (const est of knnEstimates) {
         const assessment = assessmentMap.get(est.chunk_id);
         if (assessment) {
-          // Use Haiku's per-chunk Q-value directly (blended with q_old for stability)
-          const q_new = Math.max(0, Math.min(1, 0.4 * assessment.q_value + 0.6 * est.q_old));
+          // F2: Chunk-level differential credit — adjust blend weight by contribution direction
+          const contribution = assessment.contribution ?? 0;
+          let blendWeight = 0.4; // default Haiku weight
+          if (contribution === 1) blendWeight = 0.6; // trust Haiku more for positive contributors
+          else if (contribution === -1) blendWeight = 0.2; // penalize — lean toward q_old
+
+          // F5: Process rewards — blend outcome Q with process quality
+          const processQuality = assessment.process_quality ?? 0.5;
+          const outcomeQ = blendWeight * assessment.q_value + (1 - blendWeight) * est.q_old;
+          const q_new = Math.max(UTILITY_FLOOR, Math.min(1, 0.7 * outcomeQ + 0.3 * processQuality));
           const mw = Math.max(0.5, Math.min(2.0, assessment.memory_weight));
           updates.push({ chunk_id: est.chunk_id, q_old: est.q_old, q_new, delta: q_new - est.q_old });
           updateChunkUtility(db, est.chunk_id, q_new);
           updateChunkMemoryWeight(db, est.chunk_id, Math.round(mw * 1000) / 1000);
         } else {
           // Fallback: pure EMA for chunks Haiku didn't assess
-          const q_new = Math.max(0, Math.min(1, est.q_old + 0.15 * (reward - est.q_old)));
+          const q_new = Math.max(UTILITY_FLOOR, Math.min(1, est.q_old + 0.15 * (reward - est.q_old)));
           updates.push({ chunk_id: est.chunk_id, q_old: est.q_old, q_new, delta: q_new - est.q_old });
           updateChunkUtility(db, est.chunk_id, q_new);
         }
@@ -652,6 +746,9 @@ async function updateUtilities(
 
       // Reward propagation
       propagateRewards(db, allEmbeddings, knnEstimates, updates);
+
+      // F3: Memory reconsolidation (slow path)
+      reconsolidateMemory(db, knnEstimates.map(e => e.chunk_id), userPrompt || "", hadErrors, errorText);
 
       const bellmanRecord = {
         method: "convergent_exchange",
@@ -679,7 +776,7 @@ async function updateUtilities(
       // #9: Use decoupled alpha
       const fallbackAlpha = reward >= 0 ? EMA_ALPHA_UP : EMA_ALPHA_DOWN;
       for (const est of knnEstimates) {
-        const q_new = Math.max(0, Math.min(1, est.q_old + fallbackAlpha * (reward - est.q_old)));
+        const q_new = Math.max(UTILITY_FLOOR, Math.min(1, est.q_old + fallbackAlpha * (reward - est.q_old)));
         updateChunkUtility(db, est.chunk_id, q_new);
         // #4 Titans: Data-dependent forget gate in fallback too
         const chunkEmb = recentlyRetrieved.find((r) => r.id === est.chunk_id)?.embedding;
@@ -695,6 +792,88 @@ async function updateUtilities(
 
   // Skill confidence EMA (both paths)
   await updateSkillConfidenceEMA(db, sessionId, turnNumber, hadErrors);
+}
+
+// --- F3: Memory reconsolidation — broaden/narrow chunk intents based on usage ---
+function reconsolidateMemory(
+  db: Database.Database,
+  retrievedChunkIds: number[],
+  userPrompt: string,
+  hadErrors: boolean,
+  errorText?: string
+): void {
+  try {
+    // Extract key terms from user prompt (first 3 meaningful words, >3 chars)
+    const keyTerms = (userPrompt || "")
+      .split(/\s+/)
+      .filter(w => w.length > 3 && !/^(the|this|that|with|from|have|been|will|what|when|where|which|about|their|there|would|could|should)$/i.test(w))
+      .slice(0, 3)
+      .map(w => w.toLowerCase().replace(/[^a-z0-9]/g, ""));
+
+    if (keyTerms.length === 0) return;
+
+    const chunks = getChunksByIds(db, retrievedChunkIds);
+    for (const chunk of chunks) {
+      if (!chunk.intent) continue;
+
+      if (hadErrors && errorText) {
+        // Narrow intent for error-associated chunks
+        const errorKeyword = (errorText.match(/\b\w{4,}\b/)?.[0] || "").toLowerCase();
+        if (errorKeyword && !chunk.intent.startsWith("NOT for:")) {
+          const narrowed = `NOT for: ${errorKeyword} | ${chunk.intent}`.slice(0, 300);
+          updateChunkIntent(db, chunk.id, narrowed);
+        }
+      } else if (chunk.success_count > 0) {
+        // Broaden intent for successful chunks
+        const currentTerms = chunk.intent.toLowerCase();
+        const newTerms = keyTerms.filter(t => !currentTerms.includes(t));
+        if (newTerms.length > 0) {
+          const broadened = `${chunk.intent} | ${newTerms.join(", ")}`.slice(0, 300);
+          updateChunkIntent(db, chunk.id, broadened);
+        }
+      }
+    }
+  } catch (err) {
+    rlmLog("bellman", `F3: Memory reconsolidation failed: ${String(err)}`);
+  }
+}
+
+// --- F4B: Meta-chunk promotion ---
+function promoteMetaChunks(db: Database.Database, sessionId: string): void {
+  try {
+    const allEmbs = getAllEmbeddings(db);
+    const candidates = allEmbs
+      .filter(c => c.utility > 0.7)
+      .sort((a, b) => (b.utility * b.memory_weight) - (a.utility * a.memory_weight))
+      .slice(0, 5);
+
+    const chunks = getChunksByIds(db, candidates.map(c => c.id));
+    const currentMeta = getMetaChunks(db);
+    const metaIds = new Set(currentMeta.map(m => m.id));
+    const MAX_META = 10;
+
+    for (const chunk of chunks) {
+      if (metaIds.has(chunk.id)) continue;
+      if (chunk.retrieval_count <= 3) continue;
+
+      if (currentMeta.length + (metaIds.size - currentMeta.length) >= MAX_META) {
+        // Demote lowest-utility meta-chunk
+        const lowest = currentMeta.sort((a, b) => a.utility - b.utility)[0];
+        if (lowest && lowest.utility < chunk.utility) {
+          setChunkMeta(db, lowest.id, 0);
+          rlmLog("meta", `F4B: Demoted meta-chunk ${lowest.id} (utility=${lowest.utility})`);
+        } else {
+          break;
+        }
+      }
+
+      setChunkMeta(db, chunk.id, 1);
+      metaIds.add(chunk.id);
+      rlmLog("meta", `F4B: Promoted chunk ${chunk.id} to meta (utility=${chunk.utility}, retrievals=${chunk.retrieval_count})`);
+    }
+  } catch (err) {
+    rlmLog("meta", `F4B: Meta-chunk promotion failed: ${String(err)}`);
+  }
 }
 
 // --- Reward propagation: decay Haiku Q-update to embedding neighbors ---
@@ -717,7 +896,7 @@ function propagateRewards(
       const sim = cosineSimilarity(srcFloat, bufferToFloat32(neighbor.embedding));
       if (sim < 0.4) continue; // only propagate to reasonably similar chunks
       const propagatedDelta = REWARD_PROPAGATION_DECAY * sim * update.delta;
-      const newQ = Math.max(0, Math.min(1, neighbor.utility + propagatedDelta));
+      const newQ = Math.max(UTILITY_FLOOR, Math.min(1, neighbor.utility + propagatedDelta));
       if (Math.abs(newQ - neighbor.utility) > 0.005) {
         updateChunkUtility(db, neighbor.id, newQ);
       }

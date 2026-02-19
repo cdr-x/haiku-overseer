@@ -155,6 +155,9 @@ export function openDb(dbPath: string): Database.Database {
   if (!chunkColNames.includes("memory_weight")) {
     db.exec("ALTER TABLE rlm_chunks ADD COLUMN memory_weight REAL DEFAULT 1.0");
   }
+  if (!chunkColNames.includes("is_meta")) {
+    db.exec("ALTER TABLE rlm_chunks ADD COLUMN is_meta INTEGER DEFAULT 0");
+  }
 
   const cols = db.prepare("PRAGMA table_info(token_usage)").all() as { name: string }[];
   const colNames = cols.map(c => c.name);
@@ -643,6 +646,7 @@ export interface RlmChunkRow {
   embedding: Buffer | null;
   token_count: number | null;
   memory_weight: number;
+  is_meta: number;
   created_at: string;
 }
 
@@ -730,6 +734,30 @@ export function incrementChunkSuccess(
   chunkId: number
 ): void {
   db.prepare(`UPDATE rlm_chunks SET success_count = success_count + 1 WHERE id = ?`).run(chunkId);
+}
+
+export function updateChunkIntent(
+  db: Database.Database,
+  chunkId: number,
+  newIntent: string
+): void {
+  db.prepare(`UPDATE rlm_chunks SET intent = ? WHERE id = ?`).run(newIntent, chunkId);
+}
+
+export function getMetaChunks(
+  db: Database.Database
+): RlmChunkRow[] {
+  return db.prepare(
+    `SELECT * FROM rlm_chunks WHERE is_meta = 1 AND embedding IS NOT NULL`
+  ).all() as RlmChunkRow[];
+}
+
+export function setChunkMeta(
+  db: Database.Database,
+  chunkId: number,
+  isMeta: number
+): void {
+  db.prepare(`UPDATE rlm_chunks SET is_meta = ? WHERE id = ?`).run(isMeta, chunkId);
 }
 
 export function updateChunkMemoryWeight(
